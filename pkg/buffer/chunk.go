@@ -18,7 +18,6 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/bits"
-	"gvisor.dev/gvisor/pkg/sync"
 )
 
 const (
@@ -42,21 +41,20 @@ const (
 
 // chunkPools is a collection of pools for payloads of different sizes. The
 // size of the payloads doubles in each successive pool.
-var chunkPools [numPools]sync.Pool
+var chunkPools [numPools]MonitoredPool
 
 func init() {
 	for i := 0; i < numPools; i++ {
 		chunkSize := baseChunkSize * (1 << i)
-		chunkPools[i].New = func() any {
-			return &chunk{
-				data: make([]byte, chunkSize),
-			}
+		chunkPools[i].size = int32(chunkSize)
+		chunkPools[i].pool.New = func() any {
+			return make([]byte, chunkSize)
 		}
 	}
 }
 
 // Precondition: 0 <= size <= maxChunkSize
-func getChunkPool(size int) *sync.Pool {
+func getChunkPool(size int) *MonitoredPool {
 	idx := 0
 	if size > baseChunkSize {
 		idx = bits.MostSignificantOne64(uint64(size) >> baseChunkSizeLog2)
@@ -86,8 +84,9 @@ func newChunk(size int) *chunk {
 		}
 	} else {
 		pool := getChunkPool(size)
-		c = pool.Get().(*chunk)
-		clear(c.data)
+		c = &chunk{
+			data: pool.Get().([]byte),
+		}
 	}
 	c.InitRefs()
 	return c
@@ -99,7 +98,7 @@ func (c *chunk) destroy() {
 		return
 	}
 	pool := getChunkPool(len(c.data))
-	pool.Put(c)
+	pool.Put(c.data)
 }
 
 func (c *chunk) DecRef() {
