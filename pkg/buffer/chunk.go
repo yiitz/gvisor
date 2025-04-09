@@ -24,19 +24,19 @@ const (
 	// This is log2(baseChunkSize). This number is used to calculate which pool
 	// to use for a payload size by right shifting the payload size by this
 	// number and passing the result to MostSignificantOne64.
-	baseChunkSizeLog2 = 6
+	baseChunkSizeLog2 = 7
 
 	// This is the size of the buffers in the first pool. Each subsequent pool
 	// creates payloads 2^(pool index) times larger than the first pool's
 	// payloads.
-	baseChunkSize = 1 << baseChunkSizeLog2 // 64
+	baseChunkSize = 1 << baseChunkSizeLog2
 
 	// MaxChunkSize is largest payload size that we pool. Payloads larger than
 	// this will be allocated from the heap and garbage collected as normal.
-	MaxChunkSize = baseChunkSize << (numPools - 1) // 64k
+	MaxChunkSize = baseChunkSize << (numPools - 1)
 
 	// The number of chunk pools we have for use.
-	numPools = 11
+	numPools = 10
 )
 
 // chunkPools is a collection of pools for payloads of different sizes. The
