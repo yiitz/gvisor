@@ -103,6 +103,10 @@ type endpoint struct {
 
 	localPort  uint16
 	remotePort uint16
+
+	// yiitz patch
+	readChan    chan<- any
+	readChanMsg any
 }
 
 func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) *endpoint {
@@ -986,6 +990,11 @@ func (e *endpoint) HandlePacket(id stack.TransportEndpointID, pkt *stack.PacketB
 	// Notify any waiters that there's data to be read now.
 	if wasEmpty {
 		e.waiterQueue.Notify(waiter.ReadableEvents)
+	}
+
+	// yiitz patch
+	if e.readChanMsg != nil {
+		e.readChan <- e.readChanMsg
 	}
 }
 
