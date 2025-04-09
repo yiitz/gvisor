@@ -59,6 +59,9 @@ func (p *MonitoredPool) Put(x any) {
 var GetStackTrace func(int) string
 
 func GetChunkPool(size int32) *MonitoredPool {
+	if size > MaxChunkSize {
+		return nil
+	}
 	return getChunkPool(int(size))
 }
 
