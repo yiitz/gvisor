@@ -5,11 +5,10 @@ func (r *ForwarderRequest) ReleaseReqPacket() {
 	r.pkt = nil
 }
 
-func (e *endpoint) SetReadChan(readChan chan<- any, readChanMsg any) {
-	e.readChan = readChan
-	e.readChanMsg = readChanMsg
+func (e *endpoint) SetNotifyReadFunc(notifyReadFunc func()) {
+	e.notifyReadFunc = notifyReadFunc
 }
 
-type SetReadChaner interface {
-	SetReadChan(readChan chan<- any, readChanMsg any)
+type ISetNotifyReadFunc interface {
+	SetNotifyReadFunc(notifyReadFunc func())
 }

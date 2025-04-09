@@ -105,8 +105,7 @@ type endpoint struct {
 	remotePort uint16
 
 	// yiitz patch
-	readChan    chan<- any
-	readChanMsg any
+	notifyReadFunc func()
 }
 
 func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) *endpoint {
@@ -993,8 +992,8 @@ func (e *endpoint) HandlePacket(id stack.TransportEndpointID, pkt *stack.PacketB
 	}
 
 	// yiitz patch
-	if e.readChanMsg != nil {
-		e.readChan <- e.readChanMsg
+	if e.notifyReadFunc != nil {
+		e.notifyReadFunc()
 	}
 }
 
