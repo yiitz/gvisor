@@ -1,6 +1,9 @@
 package udp
 
-func (r *ForwarderRequest) ReleaseReqPacket() {
+func (r *ForwarderRequest) Complete() {
+	if r.pkt == nil {
+		return
+	}
 	r.pkt.DecRef()
 	r.pkt = nil
 }
