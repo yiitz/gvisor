@@ -23,9 +23,9 @@ var MonitoredPoolLevel = 1
 type MonitoredPool struct {
 	pool         sync.Pool
 	currentObj   sync.Map
+	totalCount   int64
 	currentCount int32
 	maxCount     int32
-	totalCount   int32
 	size         int32
 }
 
@@ -36,7 +36,7 @@ func (p *MonitoredPool) Get() any {
 		p.currentObj.Store(unsafe.SliceData(x.([]byte)), GetStackTrace(10))
 		fallthrough
 	case 1:
-		atomic.AddInt32(&p.totalCount, 1)
+		atomic.AddInt64(&p.totalCount, 1)
 		n := atomic.AddInt32(&p.currentCount, 1)
 		if n > p.maxCount {
 			p.maxCount = n
