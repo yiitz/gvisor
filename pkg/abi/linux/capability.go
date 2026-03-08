@@ -16,6 +16,7 @@ package linux
 
 import (
 	"strings"
+	"structs"
 )
 
 // A Capability represents the ability to perform a privileged operation.
@@ -230,11 +231,9 @@ const (
 // Constants that are used by file capability extended attributes, defined
 // in Linux's include/uapi/linux/capability.h.
 const (
-	// The flag decides the value of effective file capabilit
+	// VFS_CAP_FLAGS_EFFECTIVE allows the effective capability set to be
+	// initialized with the permitted file capabilities.
 	VFS_CAP_FLAGS_EFFECTIVE = 0x000001
-	// VFS_CAP_REVISION_1 was the original file capability implementation,
-	// which supported 32-bit masks for file capabilities.
-	VFS_CAP_REVISION_1 = 0x01000000
 	// VFS_CAP_REVISION_2 allows for file capability masks that are 64
 	// bits in size, and was necessary as the number of supported
 	// capabilities grew beyond 32.
@@ -246,18 +245,88 @@ const (
 	// extended attribute.
 	VFS_CAP_REVISION_3    = 0x03000000
 	VFS_CAP_REVISION_MASK = 0xFF000000
-	// The encoded VFS_CAP_REVISION_1 data's number of bytes.
-	XATTR_CAPS_SZ_1 = 12
-	// The encoded VFS_CAP_REVISION_2 data's number of bytes.
+	// XATTR_CAPS_SZ_2 is sizeof(struct vfs_cap_data).
 	XATTR_CAPS_SZ_2 = 20
-	// The encoded VFS_CAP_REVISION_3 data's number of bytes.
+	// XATTR_CAPS_SZ_3 is sizeof(struct vfs_ns_cap_data).
 	XATTR_CAPS_SZ_3 = 24
 )
+
+// VfsCapData is equivalent to Linux's struct vfs_cap_data.
+//
+// +marshal
+type VfsCapData struct {
+	_             structs.HostLayout
+	MagicEtc      uint32
+	PermittedLo   uint32
+	InheritableLo uint32
+	PermittedHi   uint32
+	InheritableHi uint32
+}
+
+// Permitted returns the permitted capability set.
+func (c *VfsCapData) Permitted() uint64 {
+	return uint64(c.PermittedHi)<<32 | uint64(c.PermittedLo)
+}
+
+// Inheritable returns the inheritable capability set.
+func (c *VfsCapData) Inheritable() uint64 {
+	return uint64(c.InheritableHi)<<32 | uint64(c.InheritableLo)
+}
+
+// IsRevision2 returns true if c is v2.
+func (c *VfsCapData) IsRevision2() bool {
+	return (c.MagicEtc & VFS_CAP_REVISION_MASK) == VFS_CAP_REVISION_2
+}
+
+// ToString marshals c into bytes and returns it as a string.
+func (c *VfsCapData) ToString() string {
+	buf := make([]byte, c.SizeBytes())
+	c.MarshalUnsafe(buf)
+	return string(buf)
+}
+
+// VfsNsCapData is equivalent to Linux's struct vfs_ns_cap_data.
+//
+// +marshal
+type VfsNsCapData struct {
+	_ structs.HostLayout
+	VfsCapData
+	RootID uint32
+}
+
+// ConvertToV3 converts c to v3 file capabilities.
+func (c *VfsNsCapData) ConvertToV3(rootid uint32) {
+	c.RootID = rootid
+	if c.IsRevision2() {
+		// Change to v3 while retaining the effective bit.
+		c.MagicEtc = VFS_CAP_REVISION_3 | c.MagicEtc&VFS_CAP_FLAGS_EFFECTIVE
+	}
+}
+
+// ConvertToV2 converts c to v2 file capabilities.
+func (c *VfsNsCapData) ConvertToV2() {
+	c.RootID = 0
+	if !c.IsRevision2() {
+		// Change to v2 while retaining the effective bit.
+		c.MagicEtc = VFS_CAP_REVISION_2 | c.MagicEtc&VFS_CAP_FLAGS_EFFECTIVE
+	}
+}
+
+// ToString marshals c into bytes and returns it as a string.
+func (c *VfsNsCapData) ToString() string {
+	if c.IsRevision2() {
+		return c.VfsCapData.ToString()
+	}
+	buf := make([]byte, c.SizeBytes())
+	c.MarshalUnsafe(buf)
+	return string(buf)
+}
 
 // CapUserHeader is equivalent to Linux's cap_user_header_t.
 //
 // +marshal
 type CapUserHeader struct {
+	_       structs.HostLayout
 	Version uint32
 	Pid     int32
 }
@@ -266,6 +335,7 @@ type CapUserHeader struct {
 //
 // +marshal slice:CapUserDataSlice
 type CapUserData struct {
+	_           structs.HostLayout
 	Effective   uint32
 	Permitted   uint32
 	Inheritable uint32

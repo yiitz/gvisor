@@ -28,56 +28,27 @@ import (
 
 const iovecLength = 16
 
-// MAX_RW_COUNT is the maximum size in bytes of a single read or write.
-// Reads and writes that exceed this size may be silently truncated.
-// (Linux: include/linux/fs.h:MAX_RW_COUNT)
-var MAX_RW_COUNT = int(hostarch.Addr(math.MaxInt32).RoundDown())
-
-// Activate ensures that the task has an active address space.
-func (t *Task) Activate() {
-	if mm := t.MemoryManager(); mm != nil {
-		if err := mm.Activate(t); err != nil {
-			panic("unable to activate mm: " + err.Error())
-		}
-	}
-}
-
-// Deactivate relinquishes the task's active address space.
-func (t *Task) Deactivate() {
-	if mm := t.MemoryManager(); mm != nil {
-		mm.Deactivate()
-	}
-}
-
-// CopyInBytes is a fast version of CopyIn if the caller can serialize the
-// data without reflection and pass in a byte slice.
+// CopyInBytes is a legacy wrapper for t.MemoryManager().CopyIn.
 //
-// This Task's AddressSpace must be active.
+// Preconditions: The caller must be running on the task goroutine.
 func (t *Task) CopyInBytes(addr hostarch.Addr, dst []byte) (int, error) {
-	return t.MemoryManager().CopyIn(t, addr, dst, usermem.IOOpts{
-		AddressSpaceActive: true,
-	})
+	return t.MemoryManager().CopyIn(t, addr, dst, usermem.IOOpts{})
 }
 
-// CopyOutBytes is a fast version of CopyOut if the caller can serialize the
-// data without reflection and pass in a byte slice.
+// CopyOutBytes is a legacy wrapper for t.MemoryManager().CopyOut.
 //
-// This Task's AddressSpace must be active.
+// Preconditions: The caller must be running on the task goroutine.
 func (t *Task) CopyOutBytes(addr hostarch.Addr, src []byte) (int, error) {
-	return t.MemoryManager().CopyOut(t, addr, src, usermem.IOOpts{
-		AddressSpaceActive: true,
-	})
+	return t.MemoryManager().CopyOut(t, addr, src, usermem.IOOpts{})
 }
 
 // CopyInString copies a NUL-terminated string of length at most maxlen in from
 // the task's memory. The copy will fail with syscall.EFAULT if it traverses
 // user memory that is unmapped or not readable by the user.
 //
-// This Task's AddressSpace must be active.
+// Preconditions: The caller must be running on the task goroutine.
 func (t *Task) CopyInString(addr hostarch.Addr, maxlen int) (string, error) {
-	return usermem.CopyStringIn(t, t.MemoryManager(), addr, maxlen, usermem.IOOpts{
-		AddressSpaceActive: true,
-	})
+	return usermem.CopyStringIn(t, t.MemoryManager(), addr, maxlen, usermem.IOOpts{})
 }
 
 // CopyInVector copies a NULL-terminated vector of strings from the task's
@@ -93,7 +64,7 @@ func (t *Task) CopyInString(addr hostarch.Addr, maxlen int) (string, error) {
 //	{ "a", "b", "c" } => 6 (3 for lengths, 3 for elements)
 //	{ "abc" }         => 4 (3 for length, 1 for elements)
 //
-// This Task's AddressSpace must be active.
+// Preconditions: The caller must be running on the task goroutine.
 func (t *Task) CopyInVector(addr hostarch.Addr, maxElemSize, maxTotalSize int) ([]string, error) {
 	var v []string
 	for {
@@ -129,7 +100,6 @@ func (t *Task) CopyInVector(addr hostarch.Addr, maxElemSize, maxTotalSize int) (
 //
 // Preconditions: Same as usermem.IO.CopyOut, plus:
 //   - The caller must be running on the task goroutine.
-//   - t's AddressSpace must be active.
 func (t *Task) CopyOutIovecs(addr hostarch.Addr, src hostarch.AddrRangeSeq) error {
 	switch t.Arch().Width() {
 	case 8:
@@ -159,7 +129,6 @@ func (t *Task) CopyOutIovecs(addr hostarch.Addr, src hostarch.AddrRangeSeq) erro
 //
 // Preconditions: Same as usermem.IO.CopyIn, plus:
 // * The caller must be running on the task goroutine.
-// * t's AddressSpace must be active.
 func (t *Task) CopyInIovecs(addr hostarch.Addr, numIovecs int) (hostarch.AddrRangeSeq, error) {
 	// Special case to avoid allocating allocating a single hostaddr.AddrRange.
 	if numIovecs == 1 {
@@ -190,7 +159,7 @@ func copyInIovec(ctx marshal.CopyContext, t *Task, addr hostarch.Addr) (hostarch
 	if err != nil {
 		return hostarch.AddrRangeSeq{}, err
 	}
-	return hostarch.AddrRangeSeqOf(ar).TakeFirst(MAX_RW_COUNT), nil
+	return hostarch.AddrRangeSeqOf(ar).TakeFirst(linux.MAX_RW_COUNT), nil
 }
 
 // copyInIovecs copies an array of numIovecs struct iovecs from the memory
@@ -243,7 +212,7 @@ func copyInIovecs(ctx marshal.CopyContext, t *Task, addr hostarch.Addr, numIovec
 	var total uint64
 	for i := range dst {
 		dstlen := uint64(dst[i].Length())
-		if rem := uint64(MAX_RW_COUNT) - total; rem < dstlen {
+		if rem := uint64(linux.MAX_RW_COUNT) - total; rem < dstlen {
 			dst[i].End -= hostarch.Addr(dstlen - rem)
 			dstlen = rem
 		}
@@ -288,8 +257,8 @@ func makeIovec(ctx marshal.CopyContext, t *Task, addr hostarch.Addr, b []byte) (
 // access_ok() in fs/read_write.c:vfs_read/vfs_write, and overflowing address
 // ranges are truncated to MAX_RW_COUNT by fs/read_write.c:rw_verify_area().)
 func (t *Task) SingleIOSequence(addr hostarch.Addr, length int, opts usermem.IOOpts) (usermem.IOSequence, error) {
-	if length > MAX_RW_COUNT {
-		length = MAX_RW_COUNT
+	if length > linux.MAX_RW_COUNT {
+		length = linux.MAX_RW_COUNT
 	}
 	ar, ok := t.MemoryManager().CheckIORange(addr, int64(length))
 	if !ok {

@@ -26,6 +26,7 @@
 //	      TaskSet.mu
 //	        SignalHandlers.mu
 //	          Task.mu
+//	            FSContext.mu
 //	      runningTasksMu
 //
 // Locking SignalHandlers.mu in multiple SignalHandlers requires locking
@@ -48,11 +49,12 @@ import (
 	"gvisor.dev/gvisor/pkg/devutil"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/eventchannel"
-	"gvisor.dev/gvisor/pkg/fd"
+	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/nsfs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/pipefs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sockfs"
@@ -71,15 +73,15 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/port"
-	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	sentrytime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/unimpl"
-	uspb "gvisor.dev/gvisor/pkg/sentry/unimpl/unimplemented_syscall_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/tcpip"
+
+	uspb "gvisor.dev/gvisor/pkg/sentry/unimpl/unimplemented_syscall_go_proto"
 )
 
 // IOUringEnabled is set to true when IO_URING is enabled. Added as a global to
@@ -100,9 +102,7 @@ func (uc *UserCounters) incRLimitNProc(ctx context.Context) error {
 	lim := limits.FromContext(ctx).Get(limits.ProcessCount)
 	creds := auth.CredentialsFromContext(ctx)
 	nproc := uc.rlimitNProc.Add(1)
-	if nproc > lim.Cur &&
-		!creds.HasCapability(linux.CAP_SYS_ADMIN) &&
-		!creds.HasCapability(linux.CAP_SYS_RESOURCE) {
+	if nproc > lim.Cur && !creds.HasRootCapability(linux.CAP_SYS_ADMIN) && !creds.HasRootCapability(linux.CAP_SYS_RESOURCE) {
 		uc.rlimitNProc.Add(^uint64(0))
 		return linuxerr.EAGAIN
 	}
@@ -122,6 +122,24 @@ type CgroupMount struct {
 	Fs    *vfs.Filesystem
 	Root  *vfs.Dentry
 	Mount *vfs.Mount
+}
+
+// SaveRestoreExecConfig contains the configuration for the save/restore binary.
+//
+// +stateify savable
+type SaveRestoreExecConfig struct {
+	// Argv is the argv to the save/restore binary. The binary path is expected to
+	// be argv[0]. The specified binary is executed with an environment variable
+	// (GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE) set to "save" before the kernel is
+	// saved, "restore" after the kernel is restored and restarted, and "resume"
+	// after the kernel is saved and resumed.
+	Argv []string
+	// Timeout is the timeout for the save/restore binary. If the binary fails to
+	// exit within this timeout the save/restore operation will fail.
+	Timeout time.Duration
+	// LeaderTask is the task in the kernel that the save/restore binary will run
+	// under.
+	LeaderTask *Task
 }
 
 // Kernel represents an emulated Linux kernel. It must be initialized by calling
@@ -368,8 +386,19 @@ type Kernel struct {
 	// when checkpoint/restore are done. It's protected by checkpointMu.
 	checkpointGen CheckpointGeneration
 
-	// UnixSocketOpts stores configuration options for management of unix sockets.
-	UnixSocketOpts transport.UnixSocketOpts
+	// SaveRestoreExecConfig stores configuration options for the save/restore
+	// exec binary.
+	SaveRestoreExecConfig *SaveRestoreExecConfig
+
+	// NvidiaDriverVersion is the NVIDIA driver version configured for this
+	// sandbox.
+	NvidiaDriverVersion nvconf.DriverVersion
+
+	// AllowSUID determines if the SUID/SGID bits are honored during execve.
+	AllowSUID bool
+
+	// MaxKeySetSize is the maximum number of keys in a key set.
+	MaxKeySetSize atomicbitops.Int32
 }
 
 // InitKernelArgs holds arguments to Init.
@@ -415,16 +444,13 @@ type InitKernelArgs struct {
 	// RootIPCNamespace is the root IPC namespace.
 	RootIPCNamespace *IPCNamespace
 
-	// PIDNamespace is the root PID namespace.
-	PIDNamespace *PIDNamespace
+	// RootPIDNamespace is the root PID namespace.
+	RootPIDNamespace *PIDNamespace
 
 	// MaxFDLimit specifies the maximum file descriptor number that can be
 	// used by processes.  If it is zero, the limit will be set to
 	// unlimited.
 	MaxFDLimit int32
-
-	// UnixSocketOpts contains configuration options for unix sockets.
-	UnixSocketOpts transport.UnixSocketOpts
 }
 
 // Init initialize the Kernel with no tasks.
@@ -447,7 +473,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 
 	k.featureSet = args.FeatureSet
 	k.timekeeper = args.Timekeeper
-	k.tasks = newTaskSet(args.PIDNamespace)
+	k.tasks = newTaskSet(args.RootPIDNamespace)
 	k.rootUserNamespace = args.RootUserNamespace
 	k.rootUTSNamespace = args.RootUTSNamespace
 	k.rootIPCNamespace = args.RootIPCNamespace
@@ -459,6 +485,11 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	k.cpuClockTickerWakeCh = make(chan struct{}, 1)
 	k.cpuClockTickerStopCond.L = &k.runningTasksMu
 	k.applicationCores = args.ApplicationCores
+	if args.UseHostCores && k.HasCPUNumbers() {
+		args.UseHostCores = false
+		log.Infof("UseHostCores enabled but the platform implements HasCPUNumbers(): setting UseHostCores to false")
+	}
+
 	if args.UseHostCores {
 		k.useHostCores = true
 		maxCPU, err := hostcpu.MaxPossibleCPU()
@@ -471,6 +502,16 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 			k.applicationCores = minAppCores
 		}
 	}
+
+	if k.HasCPUNumbers() {
+		numCPUs := uint(k.NumCPUs())
+		if k.applicationCores < numCPUs {
+			log.Infof("ApplicationCores is less than NumCPUs: %d < %d", k.applicationCores, numCPUs)
+			log.Infof("Setting applicationCores to NumCPUs: %d", numCPUs)
+			k.applicationCores = numCPUs
+		}
+	}
+
 	k.extraAuxv = args.ExtraAuxv
 	k.vdso = args.Vdso
 	k.vdsoParams = args.VdsoParams
@@ -514,6 +555,8 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	k.rootIPCNamespace.SetInode(nsfs.NewInode(ctx, k.nsfsMount, k.rootIPCNamespace))
 	k.rootUTSNamespace.SetInode(nsfs.NewInode(ctx, k.nsfsMount, k.rootUTSNamespace))
 
+	args.RootPIDNamespace.InitInode(ctx, k)
+
 	tmpfsOpts := vfs.GetFilesystemOptions{
 		InternalData: tmpfs.FilesystemOpts{
 			// See mm/shmem.c:shmem_init() => vfs_kern_mount(flags=SB_KERNMOUNT).
@@ -547,7 +590,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	k.sockets = make(map[*vfs.FileDescription]*SocketRecord)
 
 	k.cgroupRegistry = newCgroupRegistry()
-	k.UnixSocketOpts = args.UnixSocketOpts
+	k.MaxKeySetSize = atomicbitops.FromInt32(auth.MaxSetSize)
 	return nil
 }
 
@@ -556,11 +599,7 @@ type privateMemoryFileMetadata struct {
 	owners []string
 }
 
-func savePrivateMFs(ctx context.Context, w io.Writer, pw io.Writer, mfsToSave map[string]*pgalloc.MemoryFile, mfOpts pgalloc.SaveOpts) error {
-	// mfOpts.ExcludeCommittedZeroPages is expected to reflect application
-	// memory usage behavior, but not necessarily usage of private MemoryFiles.
-	mfOpts.ExcludeCommittedZeroPages = false
-
+func savePrivateMFs(ctx context.Context, w io.Writer, mfsToSave map[string]*pgalloc.MemoryFile, mfOpts *pgalloc.SaveOpts) error {
 	var meta privateMemoryFileMetadata
 	// Generate the order in which private memory files are saved.
 	for fsID := range mfsToSave {
@@ -572,22 +611,40 @@ func savePrivateMFs(ctx context.Context, w io.Writer, pw io.Writer, mfsToSave ma
 	}
 	// Followed by the private memory files in order.
 	for _, fsID := range meta.owners {
-		if err := mfsToSave[fsID].SaveTo(ctx, w, pw, mfOpts); err != nil {
+		if err := mfsToSave[fsID].SaveTo(ctx, w, mfOpts); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// SaveTo saves the state of k to w.
+// SaveTo saves the state of k to stateFile. It takes ownership of stateFile,
+// pagesMetadata, and pagesFile, even if it returns a non-nil error.
 //
 // Preconditions: The kernel must be paused throughout the call to SaveTo.
-func (k *Kernel) SaveTo(ctx context.Context, w, pagesMetadata io.Writer, pagesFile *fd.FD, mfOpts pgalloc.SaveOpts) error {
+func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool) error {
 	saveStart := time.Now()
+
+	stateFileCleanup := cleanup.Make(func() { stateFile.Close() })
+	defer stateFileCleanup.Clean()
+
+	parallelMFSave := pagesMetadata != nil
+	var pagesCleanup cleanup.Cleanup
+	if parallelMFSave {
+		pagesCleanup.Add(func() {
+			pagesMetadata.Close()
+			pagesFile.Close()
+		})
+	}
+	defer pagesCleanup.Clean()
 
 	// Do not allow other Kernel methods to affect it while it's being saved.
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
+
+	// Suspend fdnotifier notifications.
+	fdnotifier.Pause()
+	defer fdnotifier.Resume()
 
 	// Stop time.
 	k.pauseTimeLocked(ctx)
@@ -621,14 +678,14 @@ func (k *Kernel) SaveTo(ctx context.Context, w, pagesMetadata io.Writer, pagesFi
 		mfSaveWg  sync.WaitGroup
 		mfSaveErr error
 	)
-	parallelMfSave := pagesMetadata != nil && pagesFile != nil
-	if parallelMfSave {
+	if parallelMFSave {
 		// Parallelize MemoryFile save and kernel save. Both are independent.
 		mfSaveWg.Add(1)
 		go func() {
 			defer mfSaveWg.Done()
-			mfSaveErr = k.saveMemoryFiles(ctx, w, pagesMetadata, pagesFile, mfsToSave, mfOpts)
+			mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, mfsToSave, appMFExcludeCommittedZeroPages) // transfers ownership
 		}()
+		pagesCleanup.Release()
 		// Defer a Wait() so we wait for k.saveMemoryFiles() to complete even if we
 		// error out without reaching the other Wait() below.
 		defer mfSaveWg.Wait()
@@ -640,7 +697,7 @@ func (k *Kernel) SaveTo(ctx context.Context, w, pagesMetadata io.Writer, pagesFi
 	//
 	// N.B. This will also be saved along with the full kernel save below.
 	cpuidStart := time.Now()
-	if _, err := state.Save(ctx, w, &k.featureSet); err != nil {
+	if _, err := state.Save(ctx, stateFile, &k.featureSet); err != nil {
 		return err
 	}
 	log.Infof("CPUID save took [%s].", time.Since(cpuidStart))
@@ -650,6 +707,8 @@ func (k *Kernel) SaveTo(ctx context.Context, w, pagesMetadata io.Writer, pagesFi
 	if rootNS := k.rootNetworkNamespace; rootNS != nil && rootNS.Stack() != nil {
 		// Pause the network stack.
 		netstackPauseStart := time.Now()
+		// Stack.removeConf should be true when resume=false and vice versa.
+		k.rootNetworkNamespace.Stack().SetRemoveConf(!resume)
 		log.Infof("Pausing root network namespace")
 		k.rootNetworkNamespace.Stack().Pause()
 		defer k.rootNetworkNamespace.Stack().Resume()
@@ -658,20 +717,37 @@ func (k *Kernel) SaveTo(ctx context.Context, w, pagesMetadata io.Writer, pagesFi
 
 	// Save the kernel state.
 	kernelStart := time.Now()
-	stats, err := state.Save(ctx, w, k)
+	stats, err := state.Save(ctx, stateFile, k)
 	if err != nil {
 		return err
 	}
 	log.Infof("Kernel save stats: %s", stats.String())
 	log.Infof("Kernel save took [%s].", time.Since(kernelStart))
 
-	if parallelMfSave {
+	if parallelMFSave {
+		// Close stateFile while MemoryFile saving is in progress to overlap
+		// their latencies.
+		err := stateFile.Close()
+		stateFileCleanup.Release()
+		if err != nil {
+			return fmt.Errorf("closing state file failed: %w", err)
+		}
 		mfSaveWg.Wait()
+		if mfSaveErr != nil {
+			return mfSaveErr
+		}
 	} else {
-		mfSaveErr = k.saveMemoryFiles(ctx, w, pagesMetadata, pagesFile, mfsToSave, mfOpts)
-	}
-	if mfSaveErr != nil {
-		return mfSaveErr
+		mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, mfsToSave, appMFExcludeCommittedZeroPages)
+		if mfSaveErr != nil {
+			return mfSaveErr
+		}
+		// Can't close stateFile until k.saveMemoryFiles() finishes writing to
+		// it.
+		err := stateFile.Close()
+		stateFileCleanup.Release()
+		if err != nil {
+			return fmt.Errorf("closing state file failed: %w", err)
+		}
 	}
 
 	log.Infof("Overall save took [%s].", time.Since(saveStart))
@@ -683,22 +759,71 @@ func (k *Kernel) BeforeResume(ctx context.Context) {
 	k.vfs.BeforeResume(ctx)
 }
 
-func (k *Kernel) saveMemoryFiles(ctx context.Context, w, pagesMetadata io.Writer, pagesFile *fd.FD, mfsToSave map[string]*pgalloc.MemoryFile, mfOpts pgalloc.SaveOpts) error {
-	// Save the memory files' state.
+// saveMemoryFiles saves both the application memory file and all MemoryFiles
+// in mfsToSave. If w is non-nil, then pagesMetadata and pagesFile must be nil,
+// and MemoryFile state will be saved to w. Otherwise, pagesMetadata and
+// pagesFile must be non-nil, saveMemoryFiles takes ownership of both
+// pagesMetadata and pagesFile (even if it returns a non-nil error), and
+// MemoryFile state will be saved to pagesMetadata and pagesFile.
+func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, mfsToSave map[string]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages bool) error {
 	memoryStart := time.Now()
+
 	pmw := w
+	var pmwCleanup cleanup.Cleanup
 	if pagesMetadata != nil {
 		pmw = pagesMetadata
+		pmwCleanup.Add(func() { pagesMetadata.Close() })
 	}
-	pw := w
+	defer pmwCleanup.Clean()
+
+	mfOpts := pgalloc.SaveOpts{
+		ExcludeCommittedZeroPages: appMFExcludeCommittedZeroPages,
+	}
+	var (
+		asyncPageSaveWg      sync.WaitGroup
+		asyncPageSaveErr     error
+		asyncPageSaveCleanup cleanup.Cleanup
+	)
+	defer asyncPageSaveCleanup.Clean()
 	if pagesFile != nil {
-		pw = pagesFile
+		asyncPageSaveWg.Add(1)
+		apfs, err := pgalloc.StartAsyncPagesFileSave(pagesFile, func(err error) {
+			defer asyncPageSaveWg.Done()
+			asyncPageSaveErr = err
+		}) // transfers ownership
+		if err != nil {
+			return fmt.Errorf("failed to start async pages file saving: %w", err)
+		}
+		asyncPageSaveCleanup.Add(func() {
+			apfs.MemoryFilesDone()
+			asyncPageSaveWg.Wait()
+		})
+		mfOpts.PagesFile = apfs
 	}
-	if err := k.mf.SaveTo(ctx, pmw, pw, mfOpts); err != nil {
+
+	if err := k.mf.SaveTo(ctx, pmw, &mfOpts); err != nil {
 		return err
 	}
-	if err := savePrivateMFs(ctx, pmw, pw, mfsToSave, mfOpts); err != nil {
+	// appMFExcludeCommittedZeroPages is expected to reflect application memory
+	// usage behavior, but not necessarily usage of private MemoryFiles.
+	mfOpts.ExcludeCommittedZeroPages = false
+	if err := savePrivateMFs(ctx, pmw, mfsToSave, &mfOpts); err != nil {
 		return err
+	}
+	if pagesMetadata != nil {
+		// Close pagesMetadata while async MemoryFile saving is in progress to
+		// overlap their latencies.
+		err := pagesMetadata.Close()
+		pmwCleanup.Release()
+		if err != nil {
+			return fmt.Errorf("failed to close pages metadata file: %w", err)
+		}
+	}
+
+	// Wait for page saving to complete and report errors.
+	asyncPageSaveCleanup.Release()()
+	if asyncPageSaveErr != nil {
+		return fmt.Errorf("failed to save MemoryFile pages: %w", asyncPageSaveErr)
 	}
 	log.Infof("Memory files save took [%s].", time.Since(memoryStart))
 	return nil
@@ -720,7 +845,7 @@ func (k *Kernel) invalidateUnsavableMappings(ctx context.Context) error {
 			}
 		}
 		// I really wish we just had a sync.Map of all MMs...
-		if r, ok := t.runState.(*runSyscallAfterExecStop); ok {
+		if r, ok := t.runState.(*runExecveAfterSiblingExitStop); ok {
 			if err := r.image.MemoryManager.InvalidateUnsavable(ctx); err != nil {
 				return err
 			}
@@ -730,12 +855,8 @@ func (k *Kernel) invalidateUnsavableMappings(ctx context.Context) error {
 }
 
 // LoadFrom returns a new Kernel loaded from args.
-func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, pfl PagesFileLoader, background bool, timeReady chan struct{}, net inet.Stack, clocks sentrytime.Clocks, vfsOpts *vfs.CompleteRestoreOptions, saveRestoreNet bool) error {
+func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, asyncMFLoader *AsyncMFLoader, timeReady chan struct{}, net inet.Stack, clocks sentrytime.Clocks, vfsOpts *vfs.CompleteRestoreOptions, saveRestoreNet bool) error {
 	loadStart := time.Now()
-
-	if err := pfl.KickoffPrivate(ctx); err != nil {
-		return fmt.Errorf("failed to load private memory files: %w", err)
-	}
 
 	k.runningTasksCond.L = &k.runningTasksMu
 	k.cpuClockTickerWakeCh = make(chan struct{}, 1)
@@ -761,6 +882,10 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, pfl PagesFileLoader,
 		return err
 	}
 
+	// Suspend fdnotifier notifications.
+	fdnotifier.Pause()
+	defer fdnotifier.Resume()
+
 	// Load the kernel state.
 	kernelStart := time.Now()
 	stats, err := state.Load(ctx, r, k)
@@ -770,16 +895,27 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, pfl PagesFileLoader,
 	log.Infof("Kernel load stats: %s", stats.String())
 	log.Infof("Kernel load took [%s].", time.Since(kernelStart))
 
-	if err := pfl.Load(ctx, k.mf, background); err != nil {
-		return fmt.Errorf("failed to load memory files: %w", err)
-	}
-
 	if !saveRestoreNet {
 		// rootNetworkNamespace and stack should be populated after
 		// loading the state file. Reset the stack before restoring the
 		// root network stack.
 		k.rootNetworkNamespace.ResetStack()
 		k.rootNetworkNamespace.RestoreRootStack(net)
+	}
+
+	if asyncMFLoader == nil {
+		mfStart := time.Now()
+		if err := k.loadMemoryFiles(ctx, r); err != nil {
+			return fmt.Errorf("failed to load memory files: %w", err)
+		}
+		log.Infof("Memory files load took [%s].", time.Since(mfStart))
+	} else {
+		// Timekeeper restore below tries writing to the main MF. If async page
+		// loading is being used, we need to make sure that the main MF loading has
+		// started before we try to write to it.
+		if err := asyncMFLoader.WaitMainMFStart(); err != nil {
+			return fmt.Errorf("main MF start failed: %w", err)
+		}
 	}
 
 	k.Timekeeper().SetClocks(clocks, k.vdsoParams)
@@ -805,8 +941,6 @@ func (k *Kernel) LoadFrom(ctx context.Context, r io.Reader, pfl PagesFileLoader,
 	if err := k.vfs.CompleteRestore(ctx, vfsOpts); err != nil {
 		return vfs.PrependErrMsg("vfs.CompleteRestore() failed", err)
 	}
-
-	tcpip.AsyncLoading.Wait()
 
 	log.Infof("Overall load took [%s] after async work", time.Since(loadStart))
 
@@ -858,6 +992,9 @@ type CreateProcessArgs struct {
 
 	// Credentials is the initial credentials.
 	Credentials *auth.Credentials
+
+	// NoNewPrivs is the initial prctl NO_NEW_PRIVS state.
+	NoNewPrivs bool
 
 	// FDTable is the initial set of file descriptors. If CreateProcess succeeds,
 	// it takes a reference on FDTable.
@@ -999,10 +1136,13 @@ func (ctx *createProcessContext) getMemoryCgroupID() uint32 {
 //
 // CreateProcess has no analogue in Linux; it is used to create the initial
 // application task, as well as processes started by the control server.
+//
+// Precondition: Caller must take a ref on args.MountNamespace, which is
+// transferred to CreateProcess.
 func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, error) {
 	k.extMu.Lock()
 	defer k.extMu.Unlock()
-	log.Infof("EXEC: %v", args.Argv)
+	log.Infof("EXEC: %#v", args.Argv)
 
 	ctx := args.NewContext(k)
 	mntns := args.MountNamespace
@@ -1017,6 +1157,8 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	// Get the root directory from the MountNamespace.
 	root := mntns.Root(ctx)
 	defer root.DecRef(ctx)
+	refcountCu := cleanup.Make(func() { mntns.DecRef(ctx) })
+	defer refcountCu.Clean()
 
 	// Grab the working directory.
 	wd := root // Default.
@@ -1042,6 +1184,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		defer wd.DecRef(ctx)
 	}
 	fsContext := NewFSContext(root, wd, args.Umask)
+	refcountCu.Add(func() { fsContext.DecRef(ctx) })
 
 	tg := k.NewThreadGroup(args.PIDNamespace, NewSignalHandlers(), linux.SIGCHLD, args.Limits)
 	cu := cleanup.Make(func() {
@@ -1082,23 +1225,14 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		Argv:                args.Argv,
 		Envv:                args.Envv,
 		Features:            k.featureSet,
+		NoNewPrivs:          args.NoNewPrivs,
+		StopPrivGain:        false,
+		AllowSUID:           k.AllowSUID,
 	}
 
-	image, se := k.LoadTaskImage(ctx, loadArgs)
+	image, newCreds, _, se := k.LoadTaskImage(ctx, loadArgs)
 	if se != nil {
 		return nil, 0, errors.New(se.String())
-	}
-	var capData auth.VfsCapData
-	if len(image.FileCaps()) != 0 {
-		var err error
-		capData, err = auth.VfsCapDataOf([]byte(image.FileCaps()))
-		if err != nil {
-			return nil, 0, err
-		}
-	}
-	creds, err := auth.CapsFromVfsCaps(capData, args.Credentials)
-	if err != nil {
-		return nil, 0, err
 	}
 	args.FDTable.IncRef()
 
@@ -1109,7 +1243,8 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		TaskImage:        image,
 		FSContext:        fsContext,
 		FDTable:          args.FDTable,
-		Credentials:      creds,
+		Credentials:      newCreds,
+		NoNewPrivs:       args.NoNewPrivs,
 		NetworkNamespace: k.RootNetworkNamespace(),
 		AllowedCPUMask:   sched.NewFullCPUSet(k.applicationCores),
 		UTSNamespace:     args.UTSNamespace,
@@ -1125,6 +1260,7 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	config.UTSNamespace.IncRef()
 	config.IPCNamespace.IncRef()
 	config.NetworkNamespace.IncRef()
+	refcountCu.Release() // refs(mntns, fsContext) are transferred to NewTask()
 	t, err := k.tasks.NewTask(ctx, config)
 	if err != nil {
 		return nil, 0, err
@@ -1376,6 +1512,8 @@ func (k *Kernel) IsPaused() bool {
 }
 
 // ReceiveTaskStates receives full states for all tasks.
+//
+// Precondition: The kernel must be paused.
 func (k *Kernel) ReceiveTaskStates() {
 	k.extMu.Lock()
 	k.tasks.PullFullState()
@@ -1896,6 +2034,7 @@ func (k *Kernel) Release() {
 	k.rootUTSNamespace.DecRef(ctx)
 	k.cleaupDevGofers()
 	k.mf.Destroy()
+	k.RootPIDNamespace().DecRef(ctx)
 }
 
 // PopulateNewCgroupHierarchy moves all tasks into a newly created cgroup
@@ -1961,9 +2100,9 @@ func (k *Kernel) ReplaceFSContextRoots(ctx context.Context, oldRoot vfs.VirtualD
 	k.tasks.mu.RLock()
 	oldRootDecRefs := 0
 	k.tasks.forEachTaskLocked(func(t *Task) {
-		t.mu.Lock()
+		t.mu.Lock() // To prevent t's task goroutine from unsharing its fsContext from under us.
 		defer t.mu.Unlock()
-		if fsc := t.fsContext; fsc != nil {
+		if fsc := t.FSContext(); fsc != nil {
 			fsc.mu.Lock()
 			defer fsc.mu.Unlock()
 			if fsc.root == oldRoot {

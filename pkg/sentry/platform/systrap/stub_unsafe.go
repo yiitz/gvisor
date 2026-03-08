@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"math/rand"
-	"reflect"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -69,11 +68,7 @@ func copySeccompRulesToStub(instrs []bpf.Instruction, stubAddr, size uintptr) {
 		panic("not enough space for sysmsg seccomp rules")
 	}
 
-	var targetSlice []bpf.Instruction
-	sh := (*reflect.SliceHeader)(unsafe.Pointer(&targetSlice))
-	sh.Data = progPtr
-	sh.Cap = len(instrs)
-	sh.Len = sh.Cap
+	targetSlice := unsafe.Slice((*bpf.Instruction)(unsafe.Pointer(progPtr)), len(instrs))
 
 	copy(targetSlice, instrs)
 
@@ -100,7 +95,7 @@ type mapsRegion struct {
 // parseMaps parses the /proc/self/maps file and returns regions where the stub
 // region can be mapped.
 func parseMaps(stubAreaStart, stubAreaEnd, minLen uintptr) ([]mapsRegion, error) {
-	data, err := ioutil.ReadFile(fmt.Sprintf("/proc/self/maps"))
+	data, err := ioutil.ReadFile("/proc/self/maps")
 	if err != nil {
 		return nil, err
 	}
@@ -196,6 +191,7 @@ func stubInit() {
 	stubSysmsgStart = mapLen
 	stubSysmsgLen := len(sysmsg.SighandlerBlob)
 	mapLen, _ = hostarch.PageRoundUp(mapLen + uintptr(stubSysmsgLen))
+	stubExecMapEnd := mapLen
 
 	stubSysmsgRules = mapLen
 	stubSysmsgRulesLen = hostarch.PageSize * 2
@@ -279,6 +275,7 @@ func stubInit() {
 	stubSysmsgStart += stubStart
 	stubSysmsgStack += stubStart
 	stubROMapEnd += stubStart
+	stubExecMapEnd += stubStart
 	stubContextQueueRegion += stubStart
 	stubSpinningThreadQueueAddr += stubStart
 	stubContextRegion += stubStart
@@ -306,6 +303,10 @@ func stubInit() {
 	*p = uint64(stubContextQueueRegion)
 	p = (*uint64)(unsafe.Pointer(stubSysmsgStart + uintptr(sysmsg.Sighandler_blob_offset____export_spinning_queue_addr)))
 	*p = uint64(stubSpinningThreadQueueAddr)
+	if disableSyscallPatching {
+		p = (*uint64)(unsafe.Pointer(stubSysmsgStart + uintptr(sysmsg.Sighandler_blob_offset____export_disable_syscall_patching)))
+		*p = 1
+	}
 
 	prepareSeccompRules(stubSysmsgStart,
 		stubSysmsgRules, stubSysmsgRulesLen,
@@ -315,9 +316,23 @@ func stubInit() {
 	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_MPROTECT,
 		stubStart,
-		stubROMapEnd-stubStart,
+		stubExecMapEnd-stubStart,
 		unix.PROT_EXEC|unix.PROT_READ); errno != 0 {
 		panic("mprotect failed: " + errno.Error())
+	}
+	if errno := hostsyscall.RawSyscallErrno(
+		unix.SYS_MPROTECT,
+		stubExecMapEnd,
+		stubROMapEnd-stubExecMapEnd,
+		unix.PROT_READ); errno != 0 {
+		panic("mprotect failed: " + errno.Error())
+	}
+	if errno := hostsyscall.RawSyscallErrno(
+		unix.SYS_MSEAL,
+		stubStart,
+		stubROMapEnd-stubStart,
+		0); errno != 0 && errno != unix.ENOSYS {
+		panic("mseal failed: " + errno.Error())
 	}
 
 	// Set the end.

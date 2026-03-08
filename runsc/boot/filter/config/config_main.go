@@ -105,6 +105,11 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 			seccomp.EqualTo(unix.SOL_SOCKET),
 			seccomp.EqualTo(unix.SO_SNDBUF),
 		},
+		seccomp.PerArg{
+			seccomp.AnyValue{},
+			seccomp.EqualTo(unix.SOL_SOCKET),
+			seccomp.EqualTo(unix.SO_PASSCRED),
+		},
 	},
 	unix.SYS_GETTID:       seccomp.MatchAll{},
 	unix.SYS_GETTIMEOFDAY: seccomp.MatchAll{},
@@ -153,11 +158,19 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 			seccomp.AnyValue{}, /* ifreq struct */
 		},
 	},
-	unix.SYS_LSEEK:   seccomp.MatchAll{},
-	unix.SYS_MADVISE: seccomp.MatchAll{},
+	unix.SYS_IO_SETUP:     seccomp.MatchAll{},
+	unix.SYS_IO_DESTROY:   seccomp.MatchAll{},
+	unix.SYS_IO_GETEVENTS: seccomp.MatchAll{},
+	unix.SYS_IO_SUBMIT:    seccomp.MatchAll{},
+	unix.SYS_LSEEK:        seccomp.MatchAll{},
+	unix.SYS_MADVISE:      seccomp.MatchAll{},
 	unix.SYS_MEMBARRIER: seccomp.PerArg{
 		seccomp.EqualTo(linux.MEMBARRIER_CMD_GLOBAL),
 		seccomp.EqualTo(0),
+	},
+	unix.SYS_MEMFD_CREATE: seccomp.PerArg{
+		seccomp.AnyValue{}, /* name */
+		seccomp.EqualTo(0), /* flags */
 	},
 	unix.SYS_MINCORE: seccomp.MatchAll{},
 	unix.SYS_MLOCK:   seccomp.MatchAll{},
@@ -203,6 +216,12 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 			seccomp.AnyValue{},
 			seccomp.EqualTo(unix.PROT_WRITE | unix.PROT_READ),
 			seccomp.EqualTo(unix.MAP_PRIVATE | unix.MAP_ANONYMOUS | unix.MAP_FIXED),
+		},
+		seccomp.PerArg{ // Used by vdso getrandom().
+			seccomp.AnyValue{},
+			seccomp.AnyValue{},
+			seccomp.EqualTo(unix.PROT_WRITE | unix.PROT_READ),
+			seccomp.EqualTo(linux.MAP_DROPPABLE | unix.MAP_ANONYMOUS),
 		},
 	},
 	unix.SYS_MPROTECT:  seccomp.MatchAll{},

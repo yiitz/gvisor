@@ -64,9 +64,7 @@ func ioctl(ctx context.Context, fd int, io usermem.IO, sysno uintptr, args arch.
 		}
 		var buf [4]byte
 		hostarch.ByteOrder.PutUint32(buf[:], uint32(val))
-		_, err := io.CopyOut(ctx, args[2].Pointer(), buf[:], usermem.IOOpts{
-			AddressSpaceActive: true,
-		})
+		_, err := io.CopyOut(ctx, args[2].Pointer(), buf[:], usermem.IOOpts{})
 		return 0, err
 	case linux.SIOCGIFFLAGS,
 		linux.SIOCGIFHWADDR,
@@ -78,9 +76,6 @@ func ioctl(ctx context.Context, fd int, io usermem.IO, sysno uintptr, args arch.
 		cc := &usermem.IOCopyContext{
 			Ctx: ctx,
 			IO:  io,
-			Opts: usermem.IOOpts{
-				AddressSpaceActive: true,
-			},
 		}
 		var ifr linux.IFReq
 		if _, err := ifr.CopyIn(cc, args[2].Pointer()); err != nil {
@@ -95,9 +90,6 @@ func ioctl(ctx context.Context, fd int, io usermem.IO, sysno uintptr, args arch.
 		cc := &usermem.IOCopyContext{
 			Ctx: ctx,
 			IO:  io,
-			Opts: usermem.IOOpts{
-				AddressSpaceActive: true,
-			},
 		}
 		var ifc linux.IFConf
 		if _, err := ifc.CopyIn(cc, args[2].Pointer()); err != nil {
@@ -107,7 +99,7 @@ func ioctl(ctx context.Context, fd int, io usermem.IO, sysno uintptr, args arch.
 		// The user's ifconf can have a nullable pointer to a buffer. Use a Sentry array if non-null.
 		ifcNested := linux.IFConf{Len: ifc.Len}
 		var ifcBuf []byte
-		if ifc.Ptr != 0 {
+		if ifc.Ptr != 0 && ifc.Len > 0 {
 			ifcBuf = make([]byte, ifc.Len)
 			ifcNested.Ptr = uint64(uintptr(unsafe.Pointer(&ifcBuf[0])))
 		}
@@ -127,9 +119,6 @@ func ioctl(ctx context.Context, fd int, io usermem.IO, sysno uintptr, args arch.
 		cc := &usermem.IOCopyContext{
 			Ctx: ctx,
 			IO:  io,
-			Opts: usermem.IOOpts{
-				AddressSpaceActive: true,
-			},
 		}
 		var ifr linux.IFReq
 		if _, err := ifr.CopyIn(cc, args[2].Pointer()); err != nil {

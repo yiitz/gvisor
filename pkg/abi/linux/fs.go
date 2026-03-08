@@ -14,6 +14,13 @@
 
 package linux
 
+import (
+	"math"
+	"structs"
+
+	"gvisor.dev/gvisor/pkg/hostarch"
+)
+
 // Filesystem types used in statfs(2).
 //
 // See linux/magic.h.
@@ -60,6 +67,7 @@ const (
 //
 // +marshal
 type Statfs struct {
+	_ structs.HostLayout
 	// Type is one of the filesystem magic values, defined above.
 	Type uint64
 
@@ -127,3 +135,8 @@ const (
 	WHITEOUT_MODE = 0
 	WHITEOUT_DEV  = 0
 )
+
+// MAX_RW_COUNT is the maximum size in bytes of a single read or write.
+// Reads and writes that exceed this size may be truncated.
+// (Linux: include/linux/fs.h:MAX_RW_COUNT)
+var MAX_RW_COUNT = int(hostarch.PageRoundDown(uint32(math.MaxInt32)))

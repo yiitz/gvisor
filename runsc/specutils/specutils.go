@@ -17,6 +17,7 @@
 package specutils
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,7 +33,6 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/bits"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/runsc/config"
@@ -50,8 +50,6 @@ const (
 	// `config.overrideAllowlist` for the list of allowed flags.
 	annotationFlagPrefix = "dev.gvisor.flag."
 
-	annotationContainerName = "io.kubernetes.cri.container-name"
-
 	// annotationContainerNameRemap allows the container name to be changed. This is useful during
 	// restore when container name has changed after it has been saved.
 	//
@@ -60,6 +58,15 @@ const (
 	//	"dev.gvisor.container-name-remap.<any-unique-id>": "<from>=<to>"
 	//	"dev.gvisor.container-name-remap.1": "cont-123=cont"
 	annotationContainerNameRemap = "dev.gvisor.container-name-remap."
+
+	// AnnotationRootfsUpperTar specifies the rootfs upper layer tar path.
+	// In multi-container pods, append the container name to select a specific
+	// container:
+	//
+	// Usage:
+	//	"dev.gvisor.tar.rootfs.upper": "<path>"
+	//	"dev.gvisor.tar.rootfs.upper.<container-name>": "<path>"
+	AnnotationRootfsUpperTar = "dev.gvisor.tar.rootfs.upper"
 
 	// annotationSeccomp indicates what seccomp rules was set to a given container.
 	//
@@ -71,6 +78,10 @@ const (
 
 	// AnnotationTPU is the annotation used to enable TPU proxy on a pod.
 	AnnotationTPU = "dev.gvisor.internal.tpuproxy"
+
+	// AnnotationCPUFeatures is the annotation used to control cpu features
+	// that exposed to user apps.
+	AnnotationCPUFeatures = "dev.gvisor.internal.cpufeatures"
 )
 
 // ExePath must point to runsc binary, which is normally the same binary. It's
@@ -82,15 +93,15 @@ var Version = specs.Version
 
 // LogSpecDebug writes the spec in a human-friendly format to the debug log.
 func LogSpecDebug(orig *specs.Spec, logSeccomp bool) {
-	if !log.IsLogging(log.Debug) {
-		return
+	if log.IsLogging(log.Debug) {
+		LogSpecCustomLogger(orig, logSeccomp, log.Debugf)
 	}
+}
 
+// LogSpecCustomLogger writes the spec in a human-friendly format to the provided logger.
+func LogSpecCustomLogger(orig *specs.Spec, logSeccomp bool, logf func(format string, args ...any)) {
 	// Strip down parts of the spec that are not interesting.
 	spec := deepcopy.Copy(orig).(*specs.Spec)
-	if spec.Process != nil {
-		spec.Process.Capabilities = nil
-	}
 	if spec.Linux != nil {
 		if !logSeccomp {
 			spec.Linux.Seccomp = nil
@@ -104,14 +115,14 @@ func LogSpecDebug(orig *specs.Spec, logSeccomp bool) {
 
 	out, err := json.MarshalIndent(spec, "", "  ")
 	if err != nil {
-		log.Debugf("Failed to marshal spec: %v", err)
+		logf("Failed to marshal spec: %v", err)
 		return
 	}
-	log.Debugf("Spec:\n%s", out)
+	logf("Spec:\n%s", out)
 }
 
 // ValidateSpec validates that the spec is compatible with runsc.
-func ValidateSpec(spec *specs.Spec) error {
+func ValidateSpec(spec *specs.Spec, conf *config.Config) error {
 	// Mandatory fields.
 	if spec.Process == nil {
 		return fmt.Errorf("Spec.Process must be defined: %+v", spec)
@@ -142,12 +153,6 @@ func ValidateSpec(spec *specs.Spec) error {
 		log.Warningf("AppArmor profile %q is being ignored", spec.Process.ApparmorProfile)
 	}
 
-	// PR_SET_NO_NEW_PRIVS is assumed to always be set.
-	// See kernel.Task.updateCredsForExecLocked.
-	if !spec.Process.NoNewPrivileges {
-		log.Warningf("noNewPrivileges ignored. PR_SET_NO_NEW_PRIVS is assumed to always be set.")
-	}
-
 	if spec.Linux != nil && spec.Linux.RootfsPropagation != "" {
 		if err := validateRootfsPropagation(spec.Linux.RootfsPropagation); err != nil {
 			return err
@@ -156,6 +161,16 @@ func ValidateSpec(spec *specs.Spec) error {
 	for _, m := range spec.Mounts {
 		if err := validateMount(&m); err != nil {
 			return err
+		}
+	}
+
+	// Validate rootfs upper tar annotation.
+	if path := RootfsTarUpperPath(spec); path != "" {
+		if !conf.AllowRootfsTarAnnotation {
+			return fmt.Errorf("rootfs tar annotation is disabled, use --allow-rootfs-tar-annotation to enable it")
+		}
+		if spec.Root.Readonly {
+			return fmt.Errorf("rootfs tar upper path is set but rootfs is readonly")
 		}
 	}
 
@@ -218,10 +233,16 @@ func ReadSpecFromFile(bundleDir string, specFile *os.File, conf *config.Config) 
 		return nil, fmt.Errorf("error reading spec from file %q: %v", specFile.Name(), err)
 	}
 	var spec specs.Spec
-	if err := json.Unmarshal(specBytes, &spec); err != nil {
-		return nil, fmt.Errorf("error unmarshaling spec from file %q: %v\n %s", specFile.Name(), err, string(specBytes))
+	decoder := json.NewDecoder(bytes.NewReader(specBytes))
+	decoder.DisallowUnknownFields()
+	if errStrictDecode := decoder.Decode(&spec); errStrictDecode != nil {
+		if errLooseDecode := json.Unmarshal(specBytes, &spec); errLooseDecode != nil {
+			return nil, fmt.Errorf("error unmarshaling spec from file %q: %v\n %s", specFile.Name(), errLooseDecode, string(specBytes))
+		} else {
+			log.Warningf("OCI spec file %q contains fields unknown to `runsc`: %v. Ignoring these fields and continuing anyway.", specFile.Name(), errStrictDecode)
+		}
 	}
-	if err := ValidateSpec(&spec); err != nil {
+	if err := ValidateSpec(&spec, conf); err != nil {
 		return nil, err
 	}
 	if err := fixSpec(&spec, bundleDir, conf); err != nil {
@@ -305,9 +326,13 @@ func ReadMounts(f *os.File) ([]specs.Mount, error) {
 }
 
 // ChangeMountType changes m.Type to the specified type. It may do necessary
-// amends to m.Options.
-func ChangeMountType(m *specs.Mount, newType string) {
-	m.Type = newType
+// amends to m.Options. It returns true if m was modified.
+func ChangeMountType(m *specs.Mount, newType string) bool {
+	updated := false
+	if m.Type != newType {
+		m.Type = newType
+		updated = true
+	}
 
 	// OCI spec allows bind mounts to be specified in options only. So if new type
 	// is not bind, remove bind/rbind from options.
@@ -319,10 +344,13 @@ func ChangeMountType(m *specs.Mount, newType string) {
 		for _, opt := range m.Options {
 			if opt != "rbind" && opt != "bind" {
 				newOpts = append(newOpts, opt)
+			} else {
+				updated = true
 			}
 		}
 		m.Options = newOpts
 	}
+	return updated
 }
 
 // Capabilities takes in spec and returns a TaskCapabilities corresponding to
@@ -369,11 +397,11 @@ func AllCapabilities() *specs.LinuxCapabilities {
 	}
 }
 
-// AllCapabilitiesUint64 returns a bitmask containing all capabilities set.
-func AllCapabilitiesUint64() uint64 {
-	var rv uint64
+// AllCapabilitiesSet returns a CapabilitySet containing all capabilities.
+func AllCapabilitiesSet() auth.CapabilitySet {
+	var rv auth.CapabilitySet
 	for _, cap := range capFromName {
-		rv |= bits.MaskOf64(int(cap))
+		rv.Add(cap)
 	}
 	return rv
 }
@@ -491,6 +519,16 @@ func IsGoferMount(m specs.Mount) bool {
 	return m.Type == "bind" && m.Source != ""
 }
 
+// IsErofsMount returns true if the given mount can be mounted as EROFS.
+func IsErofsMount(m specs.Mount) bool {
+	return m.Type == "erofs"
+}
+
+// HasMountConfig returns true if the given mount has an associated GoferMountConf.
+func HasMountConfig(m specs.Mount) bool {
+	return IsGoferMount(m) || IsErofsMount(m)
+}
+
 // MaybeConvertToBindMount converts mount type to "bind" in case any of the
 // mount options are either "bind" or "rbind" as required by the OCI spec.
 //
@@ -552,9 +590,9 @@ func DebugLogFile(logPattern, command, test string, timestamp time.Time) (*os.Fi
 		// Default format: <debug-log>/runsc.log.<yyyymmdd-hhmmss.uuuuuu>.<command>.txt
 		logPattern += "runsc.log.%TIMESTAMP%.%COMMAND%.txt"
 	}
-	logPattern = strings.Replace(logPattern, "%TIMESTAMP%", timestamp.Format("20060102-150405.000000"), -1)
-	logPattern = strings.Replace(logPattern, "%COMMAND%", command, -1)
-	logPattern = strings.Replace(logPattern, "%TEST%", test, -1)
+	logPattern = strings.ReplaceAll(logPattern, "%TIMESTAMP%", timestamp.Format("20060102-150405.000000"))
+	logPattern = strings.ReplaceAll(logPattern, "%COMMAND%", command)
+	logPattern = strings.ReplaceAll(logPattern, "%TEST%", test)
 
 	dir := filepath.Dir(logPattern)
 	if err := os.MkdirAll(dir, 0775); err != nil {
@@ -799,7 +837,24 @@ func ContainerName(spec *specs.Spec) string {
 }
 
 func containerNameNoRemap(spec *specs.Spec) string {
-	return spec.Annotations[annotationContainerName]
+	return spec.Annotations[ContainerdContainerNameAnnotation]
+}
+
+// RootfsTarUpperPath returns the path to the rootfs upper tar file, or empty
+// string if not set. In multi-container mode, only container-specific
+// annotations are used.
+func RootfsTarUpperPath(spec *specs.Spec) string {
+	if spec == nil || spec.Annotations == nil {
+		return ""
+	}
+	if name := ContainerName(spec); name != "" {
+		return spec.Annotations[AnnotationRootfsUpperTar+"."+name]
+	}
+	// Multi-container sandbox must use container-specific annotations.
+	if cType := SpecContainerType(spec); cType == ContainerTypeContainer || cType == ContainerTypeSandbox {
+		return ""
+	}
+	return spec.Annotations[AnnotationRootfsUpperTar]
 }
 
 // AnnotationToBool parses the annotation value as a bool. On failure, it logs a warning and

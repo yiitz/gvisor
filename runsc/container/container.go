@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -40,7 +41,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sighandling"
-	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
@@ -119,7 +119,7 @@ type Container struct {
 
 	// GoferPid is the PID of the gofer running along side the sandbox. May
 	// be 0 if the gofer has been killed.
-	GoferPid int `json:"goferPid"`
+	GoferPid sandbox.Pid `json:"goferPid"`
 
 	// Sandbox is the sandbox this container is running in. It's set when the
 	// container is created and reset when the sandbox is destroyed.
@@ -298,7 +298,7 @@ func New(conf *config.Config, args Args) (*Container, error) {
 		if err := nvProxyPreGoferHostSetup(args.Spec, conf); err != nil {
 			return nil, err
 		}
-		if err := runInCgroup(containerCgroup, func() error {
+		if err := cgroup.RunInCgroup(containerCgroup, func() error {
 			ioFiles, goferFilestores, devIOFile, specFile, err := c.createGoferProcess(conf, mountHints, args.Attached)
 			if err != nil {
 				return fmt.Errorf("cannot create gofer process: %w", err)
@@ -452,7 +452,7 @@ func (c *Container) startImpl(conf *config.Config, action string, startRoot func
 	} else {
 		// Join cgroup to start gofer process to ensure it's part of the cgroup from
 		// the start (and all their children processes).
-		if err := runInCgroup(c.Sandbox.CgroupJSON.Cgroup, func() error {
+		if err := cgroup.RunInCgroup(c.Sandbox.CgroupJSON.Cgroup, func() error {
 			// Create the gofer process.
 			goferFiles, goferFilestores, devIOFile, mountsFile, err := c.createGoferProcess(conf, c.Sandbox.MountHints, false /* attached */)
 			if err != nil {
@@ -552,6 +552,39 @@ func Run(conf *config.Config, args Args) (unix.WaitStatus, error) {
 	return 0, nil
 }
 
+// Update sets the resources of a running container as configured.
+func (c *Container) Update(res *specs.LinuxResources) error {
+	log.Debugf("Set resources for container, cid: %s", c.ID)
+	if err := c.requireStatus("set resources for", Created, Running); err != nil {
+		return err
+	}
+
+	if c.Sandbox == nil {
+		return fmt.Errorf("sandbox cannot be nil")
+	}
+
+	if !c.Sandbox.IsRootContainer(c.ID) {
+		return fmt.Errorf("update can only be called on the root container")
+	}
+
+	cg := c.Sandbox.CgroupJSON.Cgroup
+	if cg == nil {
+		return fmt.Errorf("cgroup cannot be nil")
+	}
+	if err := cg.Update(res); err != nil {
+		// set back to original
+		if err2 := cg.Update(c.Spec.Linux.Resources); err2 != nil {
+			return fmt.Errorf("setting back cgroup configs failed due to error: %v, your state file and actual configs might be inconsistent", err2)
+		}
+		return err
+	}
+	c.Spec.Linux.Resources = res
+
+	c.Saver.lock(BlockAcquire)
+	defer c.Saver.unlock()
+	return c.saveLocked()
+}
+
 // Execute runs the specified command in the container. It returns the PID of
 // the newly created process.
 func (c *Container) Execute(conf *config.Config, args *control.ExecArgs) (int32, error) {
@@ -574,10 +607,8 @@ func (c *Container) Event() (*boot.EventOut, error) {
 		return nil, err
 	}
 
-	if len(event.ContainerUsage) > 0 {
-		// Some stats can utilize host cgroups for accuracy.
-		c.populateStats(event)
-	}
+	// CPU stats can utilize host cgroups for accuracy.
+	c.populateStats(event)
 
 	return event, nil
 }
@@ -605,6 +636,30 @@ func (c *Container) SandboxPid() int {
 // and wait returns immediately.
 func (c *Container) Wait() (unix.WaitStatus, error) {
 	log.Debugf("Wait on container, cid: %s", c.ID)
+	if c.goferIsChild {
+		// The gofer process is a child of the current process, so we need to wait
+		// on it and collect its zombie. Start a goroutine to reap c.GoferPid. Do
+		// not block the main thread waiting for the gofer to exit. In certain
+		// multi-container scenarios, the gofer may outlive its container. For
+		// example, if a gofer-backed FD is donated by the application to another
+		// container within the sandbox. The lifecycle of the gofer will be tied to
+		// both containers, whichever lives longer.
+		go func() {
+			goferPid := c.GoferPid.Load()
+			if goferPid == 0 {
+				return
+			}
+			// The gofer process could be racily reaped by c.waitForStopped() so
+			// ignore ECHILD errors.
+			var status unix.WaitStatus
+			if _, err := unix.Wait4(goferPid, &status, 0, nil); err == nil {
+				log.Infof("Gofer process (PID=%d) reaped: exit code = %v", goferPid, status.ExitStatus())
+			} else if !errors.Is(err, unix.ECHILD) {
+				log.Warningf("error reaping the gofer process (PID=%d) from background goroutine: %v", goferPid, err)
+			}
+			c.GoferPid.Store(0)
+		}()
+	}
 	ws, err := c.Sandbox.Wait(c.ID)
 	if err == nil {
 		// Wait succeeded, container is not running anymore.
@@ -640,6 +695,26 @@ func (c *Container) WaitCheckpoint() error {
 		return fmt.Errorf("sandbox is not running")
 	}
 	return c.Sandbox.WaitCheckpoint()
+}
+
+// WaitRestore waits for the Kernel to have been successfully restored.
+func (c *Container) WaitRestore() error {
+	log.Debugf("Waiting for restore to complete in container, cid: %s", c.ID)
+	if !c.IsSandboxRunning() {
+		return fmt.Errorf("sandbox is not running")
+	}
+	return c.Sandbox.WaitRestore()
+}
+
+// TarRootfsUpperLayer serializes the rootfs upper layer of the container to a tar file. When
+// the rootfs is not an overlayfs, it returns an error. It writes the tar file
+// to outFD.
+func (c *Container) TarRootfsUpperLayer(outFD *os.File) error {
+	log.Debugf("TarRootfsUpperLayer, cid: %s", c.ID)
+	if !c.IsSandboxRunning() {
+		return fmt.Errorf("sandbox is not running")
+	}
+	return c.Sandbox.TarRootfsUpperLayer(c.ID, outFD)
 }
 
 // SignalContainer sends the signal to the container. If all is true and signal
@@ -693,12 +768,12 @@ func (c *Container) ForwardSignals(pid int32, fgProcess bool) func() {
 
 // Checkpoint sends the checkpoint call to the container.
 // The statefile will be written to f, the file at the specified image-path.
-func (c *Container) Checkpoint(imagePath string, direct bool, sfOpts statefile.Options, mfOpts pgalloc.SaveOpts) error {
+func (c *Container) Checkpoint(conf *config.Config, imagePath string, opts sandbox.CheckpointOpts) error {
 	log.Debugf("Checkpoint container, cid: %s", c.ID)
 	if err := c.requireStatus("checkpoint", Created, Running, Paused); err != nil {
 		return err
 	}
-	return c.Sandbox.Checkpoint(c.ID, imagePath, direct, sfOpts, mfOpts)
+	return c.Sandbox.Checkpoint(conf, c.ID, imagePath, opts)
 }
 
 // Pause suspends the container and its kernel.
@@ -880,7 +955,7 @@ func (c *Container) forEachSelfMount(fn func(mountSrc string)) {
 	}
 	goferMntIdx := 1 // First index is for rootfs.
 	for i := range c.Spec.Mounts {
-		if !specutils.IsGoferMount(c.Spec.Mounts[i]) {
+		if !specutils.HasMountConfig(c.Spec.Mounts[i]) {
 			continue
 		}
 		if c.GoferMountConfs[goferMntIdx].IsSelfBacked() {
@@ -890,7 +965,7 @@ func (c *Container) forEachSelfMount(fn func(mountSrc string)) {
 	}
 }
 
-func createGoferConf(overlayMedium config.OverlayMedium, mountType string, mountSrc string) (boot.GoferMountConf, error) {
+func createGoferConf(overlayMedium config.OverlayMedium, overlaySize string, mountType string, mountSrc string) (boot.GoferMountConf, error) {
 	var lower boot.GoferMountConfLowerType
 	switch mountType {
 	case boot.Bind:
@@ -906,7 +981,7 @@ func createGoferConf(overlayMedium config.OverlayMedium, mountType string, mount
 	case config.NoOverlay:
 		return boot.GoferMountConf{Lower: lower, Upper: boot.NoOverlay}, nil
 	case config.MemoryOverlay:
-		return boot.GoferMountConf{Lower: lower, Upper: boot.MemoryOverlay}, nil
+		return boot.GoferMountConf{Lower: lower, Upper: boot.MemoryOverlay, Size: overlaySize}, nil
 	case config.SelfOverlay:
 		mountSrcInfo, err := os.Stat(mountSrc)
 		if err != nil {
@@ -914,12 +989,12 @@ func createGoferConf(overlayMedium config.OverlayMedium, mountType string, mount
 		}
 		if !mountSrcInfo.IsDir() {
 			log.Warningf("self filestore is only supported for directory mounts, but mount %q is not a directory, falling back to memory", mountSrc)
-			return boot.GoferMountConf{Lower: lower, Upper: boot.MemoryOverlay}, nil
+			return boot.GoferMountConf{Lower: lower, Upper: boot.MemoryOverlay, Size: overlaySize}, nil
 		}
-		return boot.GoferMountConf{Lower: lower, Upper: boot.SelfOverlay}, nil
+		return boot.GoferMountConf{Lower: lower, Upper: boot.SelfOverlay, Size: overlaySize}, nil
 	default:
 		if overlayMedium.IsBackedByAnon() {
-			return boot.GoferMountConf{Lower: lower, Upper: boot.AnonOverlay}, nil
+			return boot.GoferMountConf{Lower: lower, Upper: boot.AnonOverlay, Size: overlaySize}, nil
 		}
 		return boot.GoferMountConf{}, fmt.Errorf("unexpected overlay medium %q", overlayMedium)
 	}
@@ -930,41 +1005,50 @@ func createGoferConf(overlayMedium config.OverlayMedium, mountType string, mount
 func (c *Container) initGoferConfs(ovlConf config.Overlay2, mountHints *boot.PodMountHints, rootfsHint *boot.RootfsHint) error {
 	// Handle root mount first.
 	overlayMedium := ovlConf.RootOverlayMedium()
+	overlaySize := ovlConf.RootOverlaySize()
 	mountType := boot.Bind
 	if rootfsHint != nil {
 		overlayMedium = rootfsHint.Overlay
 		if !specutils.IsGoferMount(rootfsHint.Mount) {
 			mountType = rootfsHint.Mount.Type
 		}
+		overlaySize = rootfsHint.Size
 	}
 	if c.Spec.Root.Readonly {
 		overlayMedium = config.NoOverlay
 	}
-	goferConf, err := createGoferConf(overlayMedium, mountType, c.Spec.Root.Path)
+	goferConf, err := createGoferConf(overlayMedium, overlaySize, mountType, c.Spec.Root.Path)
 	if err != nil {
 		return err
 	}
 	c.GoferMountConfs = append(c.GoferMountConfs, goferConf)
 
-	// Handle bind mounts.
+	// Handle sub mounts.
 	for i := range c.Spec.Mounts {
-		if !specutils.IsGoferMount(c.Spec.Mounts[i]) {
+		if !specutils.HasMountConfig(c.Spec.Mounts[i]) {
 			continue
 		}
-		overlayMedium = ovlConf.SubMountOverlayMedium()
-		mountType = boot.Bind
+		// Determine mount type: Bind for gofer mounts, erofs.Name for EROFS mounts
+		mountType := boot.Bind
+		if specutils.IsErofsMount(c.Spec.Mounts[i]) {
+			mountType = erofs.Name
+		}
+
+		overlayMedium := ovlConf.SubMountOverlayMedium()
+		overlaySize := ovlConf.SubMountOverlaySize()
 		if specutils.IsReadonlyMount(c.Spec.Mounts[i].Options) {
 			overlayMedium = config.NoOverlay
 		}
-		if hint := mountHints.FindMount(c.Spec.Mounts[i].Source); hint != nil {
+		if hint := mountHints.FindMount(c.Spec.Mounts[i].Source); hint != nil && hint.IsSandboxLocal() {
 			// Note that we want overlayMedium=self even if this is a read-only mount so that
 			// the shared mount is created correctly. Future containers may mount this writably.
 			overlayMedium = config.SelfOverlay
 			if !specutils.IsGoferMount(hint.Mount) {
 				mountType = hint.Mount.Type
 			}
+			overlaySize = ""
 		}
-		goferConf, err := createGoferConf(overlayMedium, mountType, c.Spec.Mounts[i].Source)
+		goferConf, err := createGoferConf(overlayMedium, overlaySize, mountType, c.Spec.Mounts[i].Source)
 		if err != nil {
 			return err
 		}
@@ -983,7 +1067,7 @@ func (c *Container) createGoferFilestores(ovlConf config.Overlay2, mountHints *b
 	// namespace, so that they don't prevent the host mount points from being
 	// unmounted from the host's mount namespace. We will use /proc/pid/root
 	// to access gofer's mount namespace. See proc_pid_root(5).
-	goferRootfs := fmt.Sprintf("/proc/%d/root", c.GoferPid)
+	goferRootfs := fmt.Sprintf("/proc/%d/root", c.GoferPid.Load())
 
 	// Handle rootfs first.
 	rootfsConf := c.GoferMountConfs[0]
@@ -998,7 +1082,7 @@ func (c *Container) createGoferFilestores(ovlConf config.Overlay2, mountHints *b
 	// Then handle all the bind mounts.
 	mountIdx := 1 // first one is the root
 	for _, m := range c.Spec.Mounts {
-		if !specutils.IsGoferMount(m) {
+		if !specutils.HasMountConfig(m) {
 			continue
 		}
 		mountConf := c.GoferMountConfs[mountIdx]
@@ -1117,11 +1201,12 @@ func (c *Container) stop() error {
 	}
 
 	// Try killing gofer if it does not exit with container.
-	if c.GoferPid != 0 {
-		log.Debugf("Killing gofer for container, cid: %s, PID: %d", c.ID, c.GoferPid)
-		if err := unix.Kill(c.GoferPid, unix.SIGKILL); err != nil {
-			// The gofer may already be stopped, log the error.
-			log.Warningf("Error sending signal %d to gofer %d: %v", unix.SIGKILL, c.GoferPid, err)
+	if goferPid := c.GoferPid.Load(); goferPid != 0 {
+		log.Debugf("Killing gofer for container, cid: %s, PID: %d", c.ID, goferPid)
+		// The gofer process may have been racily reaped by the goroutine from
+		// c.Wait() so ignore ESRCH errors.
+		if err := unix.Kill(goferPid, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
+			log.Warningf("Error sending signal %d to gofer %d: %v", unix.SIGKILL, goferPid, err)
 		}
 	}
 
@@ -1146,7 +1231,8 @@ func (c *Container) stop() error {
 }
 
 func (c *Container) waitForStopped() error {
-	if c.GoferPid == 0 {
+	goferPid := c.GoferPid.Load()
+	if goferPid == 0 {
 		return nil
 	}
 
@@ -1157,12 +1243,13 @@ func (c *Container) waitForStopped() error {
 	}
 
 	if c.goferIsChild {
-		// The gofer process is a child of the current process,
-		// so we can wait it and collect its zombie.
-		if _, err := unix.Wait4(int(c.GoferPid), nil, 0, nil); err != nil {
+		// The gofer process is a child of the current process, so we can wait it
+		// and collect its zombie. The gofer process could be racily reaped by the
+		// goroutine from c.Wait() so ignore ECHILD errors.
+		if _, err := unix.Wait4(int(goferPid), nil, 0, nil); err != nil && !errors.Is(err, unix.ECHILD) {
 			return fmt.Errorf("error waiting the gofer process: %v", err)
 		}
-		c.GoferPid = 0
+		c.GoferPid.Store(0)
 		return nil
 	}
 
@@ -1170,10 +1257,10 @@ func (c *Container) waitForStopped() error {
 	defer cancel()
 	b := backoff.WithContext(backoff.NewConstantBackOff(100*time.Millisecond), ctx)
 	op := func() error {
-		if err := unix.Kill(c.GoferPid, 0); err == nil {
+		if err := unix.Kill(goferPid, 0); err == nil {
 			return fmt.Errorf("gofer is still running")
 		}
-		c.GoferPid = 0
+		c.GoferPid.Store(0)
 		return nil
 	}
 	return backoff.Retry(op, b)
@@ -1195,6 +1282,20 @@ func shouldSpawnGofer(spec *specs.Spec, conf *config.Config, goferConfs []boot.G
 	}
 	// Device gofer needs a gofer process.
 	return shouldCreateDeviceGofer(spec, conf)
+}
+
+// createLisafsSocketPair creates a socket pair for Lisafs communication and
+// appends the sandbox end to sandEnds while donating the gofer end.
+func createLisafsSocketPair(sandEnds *[]*os.File, donations *donation.Agency) error {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	*sandEnds = append(*sandEnds, os.NewFile(uintptr(fds[0]), "sandbox IO FD"))
+
+	goferEnd := os.NewFile(uintptr(fds[1]), "gofer IO FD")
+	donations.DonateAndClose("io-fds", goferEnd)
+	return nil
 }
 
 // createGoferProcess returns an IO file list and a mounts file on success.
@@ -1266,6 +1367,10 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 
 	// Start with the general config flags.
 	cmd := exec.Command(specutils.ExePath, conf.ToFlags()...)
+	// Don't forward GOMAXPROCS defaults that apply to this process (in
+	// particular, containerd-shim-runsc-v1 passes GOMAXPROCS=2 in
+	// v1.service.newCommand()).
+	cmd.Env = slices.DeleteFunc(os.Environ(), func(env string) bool { return strings.HasPrefix(env, "GOMAXPROCS=") })
 	cmd.SysProcAttr = &unix.SysProcAttr{
 		// Detach from session. Otherwise, signals sent to the foreground process
 		// will also be forwarded by this process, resulting in duplicate signals.
@@ -1331,28 +1436,43 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 	}
 
 	sandEnds := make([]*os.File, 0, ioFileCount)
-	for i, cfg := range c.GoferMountConfs {
+
+	// Handle rootfs (index 0)
+	switch {
+	case c.GoferMountConfs[0].ShouldUseLisafs():
+		if err := createLisafsSocketPair(&sandEnds, &donations); err != nil {
+			return nil, nil, nil, nil, err
+		}
+
+	case c.GoferMountConfs[0].ShouldUseErofs():
+		f, err := os.Open(rootfsHint.Mount.Source)
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("opening rootfs image %q: %v", rootfsHint.Mount.Source, err)
+		}
+		sandEnds = append(sandEnds, f)
+	}
+
+	// Handle sub mounts
+	cfgIdx := 1
+	for _, m := range c.Spec.Mounts {
+		if !specutils.HasMountConfig(m) {
+			continue
+		}
+
 		switch {
-		case cfg.ShouldUseLisafs():
-			fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
-			if err != nil {
+		case c.GoferMountConfs[cfgIdx].ShouldUseLisafs():
+			if err := createLisafsSocketPair(&sandEnds, &donations); err != nil {
 				return nil, nil, nil, nil, err
 			}
-			sandEnds = append(sandEnds, os.NewFile(uintptr(fds[0]), "sandbox IO FD"))
 
-			goferEnd := os.NewFile(uintptr(fds[1]), "gofer IO FD")
-			donations.DonateAndClose("io-fds", goferEnd)
-
-		case cfg.ShouldUseErofs():
-			if i > 0 {
-				return nil, nil, nil, nil, fmt.Errorf("EROFS lower layer is only supported for root mount")
-			}
-			f, err := os.Open(rootfsHint.Mount.Source)
+		case c.GoferMountConfs[cfgIdx].ShouldUseErofs():
+			f, err := os.Open(m.Source)
 			if err != nil {
-				return nil, nil, nil, nil, fmt.Errorf("opening rootfs image %q: %v", rootfsHint.Mount.Source, err)
+				return nil, nil, nil, nil, fmt.Errorf("opening EROFS image %q: %v", m.Source, err)
 			}
 			sandEnds = append(sandEnds, f)
 		}
+		cfgIdx++
 	}
 	var devSandEnd *os.File
 	if shouldCreateDeviceGofer(c.Spec, conf) {
@@ -1402,6 +1522,13 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 			return nil, nil, nil, nil, err
 		}
 		defer syncFile.Close()
+		uid, gid := sandbox.SandboxUserGroupIDs(c.Spec)
+		if uid != 0 {
+			cmd.Args = append(cmd.Args, fmt.Sprintf("--uid=%d", uid))
+		}
+		if gid != 0 {
+			cmd.Args = append(cmd.Args, fmt.Sprintf("--gid=%d", gid))
+		}
 	}
 
 	// Create synchronization FD for chroot.
@@ -1423,7 +1550,7 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 		return nil, nil, nil, nil, fmt.Errorf("gofer: %v", err)
 	}
 	log.Infof("Gofer started, PID: %d", cmd.Process.Pid)
-	c.GoferPid = cmd.Process.Pid
+	c.GoferPid.Store(cmd.Process.Pid)
 	c.goferIsChild = true
 	rpcPidCh <- cmd.Process.Pid
 
@@ -1436,7 +1563,7 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 
 	// Set up nvproxy with the Gofer's mount namespaces while chrootSyncSandEnd is
 	// is still open.
-	if err := nvproxySetup(c.Spec, conf, c.GoferPid); err != nil {
+	if err := nvproxySetup(c.Spec, conf, c.GoferPid.Load()); err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("setting up nvproxy for gofer: %w", err)
 	}
 
@@ -1539,26 +1666,13 @@ func isRoot(spec *specs.Spec) bool {
 	return specutils.SpecContainerType(spec) != specutils.ContainerTypeContainer
 }
 
-// runInCgroup executes fn inside the specified cgroup. If cg is nil, execute
-// it in the current context.
-func runInCgroup(cg cgroup.Cgroup, fn func() error) error {
-	if cg == nil {
-		return fn()
-	}
-	restore, err := cg.Join()
-	if err != nil {
-		return err
-	}
-	defer restore()
-	return fn()
-}
-
 // adjustGoferOOMScoreAdj sets the oom_store_adj for the container's gofer.
 func (c *Container) adjustGoferOOMScoreAdj() error {
-	if c.GoferPid == 0 || c.Spec.Process.OOMScoreAdj == nil {
+	goferPid := c.GoferPid.Load()
+	if goferPid == 0 || c.Spec.Process.OOMScoreAdj == nil {
 		return nil
 	}
-	return setOOMScoreAdj(c.GoferPid, *c.Spec.Process.OOMScoreAdj)
+	return setOOMScoreAdj(goferPid, *c.Spec.Process.OOMScoreAdj)
 }
 
 // adjustSandboxOOMScoreAdj sets the oom_score_adj for the sandbox.
@@ -1666,9 +1780,9 @@ func (c *Container) populateStats(event *boot.EventOut) {
 
 	var containerUsage uint64
 	var allContainersUsage uint64
-	for ID, usage := range event.ContainerUsage {
+	for id, usage := range event.ContainerUsage {
 		allContainersUsage += usage
-		if ID == c.ID {
+		if id == c.ID {
 			containerUsage = usage
 		}
 	}
@@ -2058,6 +2172,10 @@ func nvproxySetup(spec *specs.Spec, conf *config.Config, goferPid int) error {
 		fmt.Sprintf("--pid=%d", goferPid),
 		fmt.Sprintf("--device=%s", devices),
 	}
+	if nvidiaContainerCliConfigureNeedsCudaCompatModeFlag(cliPath) {
+		// "mount" is the flag's intended default value.
+		argv = append(argv, "--cuda-compat-mode=mount")
+	}
 	// Pass driver capabilities allowed by configuration as flags. See
 	// nvidia-container-toolkit/cmd/nvidia-container-runtime-hook/main.go:doPrestart().
 	driverCaps, err := specutils.NVProxyDriverCapsFromEnv(spec, conf)
@@ -2080,6 +2198,43 @@ func nvproxySetup(spec *specs.Spec, conf *config.Config, goferPid int) error {
 		return fmt.Errorf("nvidia-container-cli configure failed, err: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
 	}
 	return nil
+}
+
+func nvidiaContainerCliConfigureNeedsCudaCompatModeFlag(cliPath string) bool {
+	cmd := exec.Cmd{
+		Path: cliPath,
+		Args: []string{cliPath, "--version"},
+	}
+	log.Debugf("Executing %q", cmd.Args)
+	out, err := cmd.Output()
+	if err != nil {
+		log.Warningf("Failed to execute nvidia-container-cli --version: %v", err)
+		return false
+	}
+	m := regexp.MustCompile(`^cli-version: (\d+)\.(\d+)\.(\d+)`).FindSubmatch(out)
+	if m == nil {
+		log.Warningf("Failed to find version number in nvidia-container-cli --version: %s", out)
+		return false
+	}
+	major, err := strconv.Atoi(string(m[1]))
+	if err != nil {
+		log.Warningf("Invalid major version number in nvidia-container-cli --version: %v", err)
+		return false
+	}
+	minor, err := strconv.Atoi(string(m[2]))
+	if err != nil {
+		log.Warningf("Invalid minor version number in nvidia-container-cli --version: %v", err)
+		return false
+	}
+	release, err := strconv.Atoi(string(m[3]))
+	if err != nil {
+		log.Warningf("Invalid release version number in nvidia-container-cli --version: %v", err)
+		return false
+	}
+	// In nvidia-container-cli 1.17.7, in which the --cuda-compat-mode flag
+	// first appears, failing to pass this flag to nvidia-container-cli
+	// configure causes all other flags to be ignored.
+	return major == 1 && minor == 17 && release == 7
 }
 
 // CheckStopped checks if the container is stopped and updates its status.

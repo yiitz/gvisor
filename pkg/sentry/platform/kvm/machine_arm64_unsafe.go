@@ -49,15 +49,19 @@ func (m *machine) initArchState() error {
 		panic(fmt.Sprintf("error setting KVM_ARM_PREFERRED_TARGET failed: %v", errno))
 	}
 
-	// Initialize all vCPUs on ARM64, while this does not happen on x86_64.
-	// The reason for the difference is that ARM64 and x86_64 have different KVM timer mechanisms.
-	// If we create vCPU dynamically on ARM64, the timer for vCPU would mess up for a short time.
+	// Initialize all vCPUs on ARM64 (we also do this on x86_64, but for
+	// ARM64 it is especially important as it has a different KVM timer
+	// mechanism).
+	// If we create vCPU dynamically on ARM64, the timer for vCPU would mess
+	// up for a short time.
 	// For more detail, please refer to https://github.com/google/gvisor/issues/5739
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	for i := 0; i < m.maxVCPUs; i++ {
-		m.createVCPU(i)
+		if _, err := m.createVCPU(i); err != nil {
+			return err
+		}
 	}
-	m.mu.Unlock()
 	return nil
 }
 
@@ -214,8 +218,8 @@ func (c *vCPU) getTSC() error {
 	reg.addr = uint64(reflect.ValueOf(&data).Pointer())
 	reg.id = _KVM_ARM64_REGS_TIMER_CNT
 
-	if err := c.getOneRegister(&reg); err != nil {
-		return err
+	if errno := c.getOneRegister(&reg); errno != 0 {
+		return fmt.Errorf("error getting KVM_ARM64_REGS_TIMER_CNT: %w", errno)
 	}
 
 	return nil
@@ -265,6 +269,7 @@ func (c *vCPU) loadSegments(tid uint64) {
 	c.tid.Store(tid)
 }
 
+//go:nosplit
 func (c *vCPU) setOneRegister(reg *kvmOneReg) error {
 	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
@@ -276,15 +281,13 @@ func (c *vCPU) setOneRegister(reg *kvmOneReg) error {
 	return nil
 }
 
-func (c *vCPU) getOneRegister(reg *kvmOneReg) error {
-	if errno := hostsyscall.RawSyscallErrno(
+//go:nosplit
+func (c *vCPU) getOneRegister(reg *kvmOneReg) unix.Errno {
+	return hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
 		_KVM_GET_ONE_REG,
-		uintptr(unsafe.Pointer(reg))); errno != 0 {
-		return fmt.Errorf("error getting one register: %v", errno)
-	}
-	return nil
+		uintptr(unsafe.Pointer(reg)))
 }
 
 // SwitchToUser unpacks architectural-details.
@@ -317,10 +320,14 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *linux.SignalInfo)
 	appRegs := switchOpts.Registers
 	c.SetAppAddr(ring0.KernelStartAddress | uintptr(unsafe.Pointer(appRegs)))
 
+	c.switchingToUser.Store(true)
+
 	entersyscall()
 	bluepill(c)
 	vector = c.CPU.SwitchToUser(switchOpts)
 	exitsyscall()
+
+	c.switchingToUser.Store(false)
 
 	switch vector {
 	case ring0.Syscall:

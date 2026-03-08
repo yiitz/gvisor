@@ -28,6 +28,12 @@ import (
 	"gvisor.dev/gvisor/pkg/sigframe"
 )
 
+// Instruction pointers used to trigger panics.
+const (
+	_PANIC_RIP_CPU_DIE   = 0xabc
+	_PANIC_RIP_EXC_CHECK = 0xabd
+)
+
 // dieArchSetup initializes the state for dieTrampoline.
 //
 // The amd64 dieTrampoline requires the vCPU to be set in BX, and the last RIP
@@ -35,7 +41,7 @@ import (
 // provided RIP.
 //
 //go:nosplit
-func dieArchSetup(c *vCPU, context *arch.SignalContext64, guestRegs *userRegs) {
+func (c *vCPU) dieArchSetup(context *arch.SignalContext64, guestRegs *userRegs, dumpExitReason bool) {
 	// Reload all registers to have an accurate stack trace when we return
 	// to host mode. This means that the stack should be unwound correctly.
 	if errno := c.getUserRegisters(&c.dieState.guestRegs); errno != 0 {
@@ -55,8 +61,30 @@ func dieArchSetup(c *vCPU, context *arch.SignalContext64, guestRegs *userRegs) {
 		context.Rbp = guestRegs.RBP
 		context.Eflags = guestRegs.RFLAGS
 	}
-	context.Rbx = uint64(uintptr(unsafe.Pointer(c)))
-	context.Rip = uint64(dieTrampolineAddr)
+	printHex([]byte("FATAL: rip = "), guestRegs.RIP)
+	printHex([]byte("FATAL: rsp = "), guestRegs.RSP)
+	printHex([]byte("FATAL: rbp = "), guestRegs.RBP)
+	printHex([]byte("FATAL: rflags = "), guestRegs.RFLAGS)
+	if dumpExitReason {
+		// Store the original instruction pointer in R9 and populates
+		// registers R10-R14 with the vCPU's exit reason and associated
+		// data from c.runData. To ensure this information is preserved
+		// in a crash report, RIP is set to an invalid address (0xabc).
+		// This forces a memory fault immediately after a sigreturn,
+		// triggering a crash report that includes the altered register
+		// state, providing diagnostic details about why the vCPU
+		// exited.
+		context.R9 = context.Rip
+		context.Rip = _PANIC_RIP_CPU_DIE
+		context.R10 = uint64(c.runData.exitReason)
+		context.R11 = c.runData.data[0]
+		context.R12 = c.runData.data[1]
+		context.R13 = c.runData.data[2]
+		context.R14 = c.runData.data[3]
+	} else {
+		context.Rbx = uint64(uintptr(unsafe.Pointer(c)))
+		context.Rip = uint64(dieTrampolineAddr)
+	}
 }
 
 // getHypercallID returns hypercall ID.
@@ -142,7 +170,7 @@ func bluepillReadyStopGuest(c *vCPU) bool {
 //
 //go:nosplit
 func bluepillArchHandleExit(c *vCPU, context unsafe.Pointer) {
-	c.die(bluepillArchContext(context), "unknown")
+	c.dieAndDumpExitReason(bluepillArchContext(context))
 }
 
 func addrOfBluepillUserHandler() uintptr

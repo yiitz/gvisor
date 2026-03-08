@@ -73,16 +73,10 @@ func GenericCheckPermissions(creds *auth.Credentials, ats AccessTypes, mode linu
 		return nil
 	}
 
-	// Caller capabilities require that the file's KUID and KGID are mapped in
-	// the caller's user namespace; compare
-	// kernel/capability.c:privileged_wrt_inode_uidgid().
-	if !kuid.In(creds.UserNamespace).Ok() || !kgid.In(creds.UserNamespace).Ok() {
-		return linuxerr.EACCES
-	}
 	// CAP_DAC_READ_SEARCH allows the caller to read and search arbitrary
 	// directories, and read arbitrary non-directory files.
 	if (mode.IsDir() && !ats.MayWrite()) || ats.OnlyRead() {
-		if creds.HasCapability(linux.CAP_DAC_READ_SEARCH) {
+		if creds.HasCapabilityOnFile(linux.CAP_DAC_READ_SEARCH, kuid, kgid) {
 			return nil
 		}
 	}
@@ -90,7 +84,7 @@ func GenericCheckPermissions(creds *auth.Credentials, ats AccessTypes, mode linu
 	// access to non-directory files, and execute access to non-directory files
 	// for which at least one execute bit is set.
 	if mode.IsDir() || !ats.MayExec() || (mode.Permissions()&0111 != 0) {
-		if creds.HasCapability(linux.CAP_DAC_OVERRIDE) {
+		if creds.HasCapabilityOnFile(linux.CAP_DAC_OVERRIDE, kuid, kgid) {
 			return nil
 		}
 	}
@@ -185,7 +179,7 @@ func MayWriteFileWithOpenFlags(flags uint32) bool {
 
 // CheckSetStat checks that creds has permission to change the metadata of a
 // file with the given permissions, UID, and GID as specified by stat, subject
-// to the rules of Linux's fs/attr.c:setattr_prepare().
+// to the rules of Linux's fs/attr.c:setattr_prepare(). Might mutate `opts`.
 func CheckSetStat(ctx context.Context, creds *auth.Credentials, opts *SetStatOptions, mode linux.FileMode, kuid auth.KUID, kgid auth.KGID) error {
 	stat := &opts.Stat
 	if stat.Mask&linux.STATX_SIZE != 0 {
@@ -201,25 +195,27 @@ func CheckSetStat(ctx context.Context, creds *auth.Credentials, opts *SetStatOpt
 		if !CanActAsOwner(creds, kuid) {
 			return linuxerr.EPERM
 		}
-		// TODO(b/30815691): "If the calling process is not privileged (Linux:
-		// does not have the CAP_FSETID capability), and the group of the file
-		// does not match the effective group ID of the process or one of its
-		// supplementary group IDs, the S_ISGID bit will be turned off, but
-		// this will not cause an error to be returned." - chmod(2)
+		// "If the calling process is not privileged (Linux: does not have the CAP_FSETID capability),
+		// and the group of the file does not match the effective group ID of the process or one of its
+		// supplementary group IDs, the S_ISGID bit will be turned off, but this will not cause an error
+		// to be returned." - chmod(2)
+		if stat.Mode&linux.S_ISGID != 0 && !creds.HasCapabilityOnFile(linux.CAP_FSETID, kuid, kgid) && !creds.InGroup(kgid) {
+			stat.Mode &^= linux.S_ISGID
+		}
 	}
 	if stat.Mask&linux.STATX_UID != 0 {
 		if !((creds.EffectiveKUID == kuid && auth.KUID(stat.UID) == kuid) ||
-			HasCapabilityOnFile(creds, linux.CAP_CHOWN, kuid, kgid)) {
+			creds.HasCapabilityOnFile(linux.CAP_CHOWN, kuid, kgid)) {
 			return linuxerr.EPERM
 		}
 	}
 	if stat.Mask&linux.STATX_GID != 0 {
 		if !((creds.EffectiveKUID == kuid && creds.InGroup(auth.KGID(stat.GID))) ||
-			HasCapabilityOnFile(creds, linux.CAP_CHOWN, kuid, kgid)) {
+			creds.HasCapabilityOnFile(linux.CAP_CHOWN, kuid, kgid)) {
 			return linuxerr.EPERM
 		}
 	}
-	if opts.NeedWritePerm && !creds.HasCapability(linux.CAP_DAC_OVERRIDE) {
+	if opts.NeedWritePerm {
 		if err := GenericCheckPermissions(creds, MayWrite, mode, kuid, kgid); err != nil {
 			return err
 		}
@@ -249,7 +245,7 @@ func CheckDeleteSticky(creds *auth.Credentials, parentMode linux.FileMode, paren
 	}
 	if creds.EffectiveKUID == childKUID ||
 		creds.EffectiveKUID == parentKUID ||
-		HasCapabilityOnFile(creds, linux.CAP_FOWNER, childKUID, childKGID) {
+		creds.HasCapabilityOnFile(linux.CAP_FOWNER, childKUID, childKGID) {
 		return nil
 	}
 	return linuxerr.EPERM
@@ -262,14 +258,7 @@ func CanActAsOwner(creds *auth.Credentials, kuid auth.KUID) bool {
 	if creds.EffectiveKUID == kuid {
 		return true
 	}
-	return creds.HasCapability(linux.CAP_FOWNER) && creds.UserNamespace.MapFromKUID(kuid).Ok()
-}
-
-// HasCapabilityOnFile returns true if creds has the given capability with
-// respect to a file with the given owning UID and GID, consistent with Linux's
-// kernel/capability.c:capable_wrt_inode_uidgid().
-func HasCapabilityOnFile(creds *auth.Credentials, cp linux.Capability, kuid auth.KUID, kgid auth.KGID) bool {
-	return creds.HasCapability(cp) && creds.UserNamespace.MapFromKUID(kuid).Ok() && creds.UserNamespace.MapFromKGID(kgid).Ok()
+	return creds.HasSelfCapability(linux.CAP_FOWNER) && creds.UserNamespace.MapFromKUID(kuid).Ok()
 }
 
 // CheckLimit enforces file size rlimits. It returns error if the write
@@ -297,12 +286,14 @@ func CheckLimit(ctx context.Context, offset, size int64) (int64, error) {
 //     must be returned by filesystem implementations.
 //   - Does not do inode permission checks. Filesystem implementations should
 //     handle inode permission checks as they may differ across implementations.
+//   - Writes in security namespace are not supported, except for writes to
+//     "security.capability", which are required to support file capabilities.
 func CheckXattrPermissions(creds *auth.Credentials, ats AccessTypes, mode linux.FileMode, kuid auth.KUID, name string) error {
 	switch {
 	case strings.HasPrefix(name, linux.XATTR_TRUSTED_PREFIX):
 		// The trusted.* namespace can only be accessed by privileged
 		// users.
-		if creds.HasCapability(linux.CAP_SYS_ADMIN) {
+		if creds.HasRootCapability(linux.CAP_SYS_ADMIN) {
 			return nil
 		}
 		if ats.MayWrite() {
@@ -325,6 +316,9 @@ func CheckXattrPermissions(creds *auth.Credentials, ats AccessTypes, mode linux.
 		}
 	case strings.HasPrefix(name, linux.XATTR_SECURITY_PREFIX):
 		if ats.MayRead() {
+			return nil
+		}
+		if name == linux.XATTR_SECURITY_CAPABILITY {
 			return nil
 		}
 		return linuxerr.EOPNOTSUPP

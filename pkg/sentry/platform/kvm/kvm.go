@@ -22,6 +22,7 @@ import (
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -62,8 +63,6 @@ type runData struct {
 
 // KVM represents a lightweight VM context.
 type KVM struct {
-	platform.NoCPUPreemptionDetection
-
 	// KVM never changes mm_structs.
 	platform.UseHostProcessMemoryBarrier
 
@@ -94,6 +93,7 @@ func New(deviceFile *fd.FD, config Config) (*KVM, error) {
 	fd := deviceFile.FD()
 
 	// Ensure global initialization is done.
+	initIoeventfdMMIO()
 	globalOnce.Do(func() {
 		globalErr = updateGlobalOnce(int(fd))
 	})
@@ -136,11 +136,6 @@ func (*KVM) SupportsAddressSpaceIO() bool {
 	return false
 }
 
-// CooperativelySchedulesAddressSpace implements platform.Platform.CooperativelySchedulesAddressSpace.
-func (*KVM) CooperativelySchedulesAddressSpace() bool {
-	return false
-}
-
 // MapUnit implements platform.Platform.MapUnit.
 func (*KVM) MapUnit() uint64 {
 	// We greedily creates PTEs in MapFile, so extremely large mappings can
@@ -161,7 +156,7 @@ func (*KVM) MaxUserAddress() hostarch.Addr {
 }
 
 // NewAddressSpace returns a new pagetable root.
-func (k *KVM) NewAddressSpace(any) (platform.AddressSpace, <-chan struct{}, error) {
+func (k *KVM) NewAddressSpace() (platform.AddressSpace, error) {
 	// Allocate page tables and install system mappings.
 	pageTables := pagetables.NewWithUpper(newAllocator(), k.machine.upperSharedPageTables, ring0.KernelStartAddress)
 
@@ -170,7 +165,48 @@ func (k *KVM) NewAddressSpace(any) (platform.AddressSpace, <-chan struct{}, erro
 		machine:    k.machine,
 		pageTables: pageTables,
 		dirtySet:   k.machine.newDirtySet(),
-	}, nil, nil
+	}, nil
+}
+
+// ConcurrencyCount implements platform.Platform.ConcurrencyCount.
+// KVM can't run more than maxVCPUs contexts concurrently.
+func (k *KVM) ConcurrencyCount() int {
+	return k.machine.maxVCPUs
+}
+
+// HasCPUNumbers implements platform.Platform.HasCPUNumbers.
+func (k *KVM) HasCPUNumbers() bool {
+	return k.machine.useCPUNums
+}
+
+// NumCPUs implements platform.Platform.NumCPUs.
+func (k *KVM) NumCPUs() int {
+	if !k.HasCPUNumbers() {
+		panic("platform is not configured to use CPU numbers")
+	}
+	return k.machine.maxVCPUs
+}
+
+// DetectsCPUPreemption implements platform.Platform.DetectsCPUPreemption.
+func (*KVM) DetectsCPUPreemption() bool {
+	return true
+}
+
+// PreemptAllCPUs implements platform.Platform.PreemptAllCPUs.
+func (k *KVM) PreemptAllCPUs() error {
+	for _, c := range k.machine.vCPUsByID {
+		c.lastCtx.Store(nil)
+		c.BounceToHost()
+	}
+	return nil
+}
+
+// PreemptCPU implements platform.Platform.PreemptCPU.
+func (k *KVM) PreemptCPU(cpu int32) error {
+	c := k.machine.vCPUsByID[cpu]
+	c.lastCtx.Store(nil)
+	c.BounceToHost()
+	return nil
 }
 
 // NewContext returns an interruptible context.
@@ -182,8 +218,12 @@ func (k *KVM) NewContext(pkgcontext.Context) platform.Context {
 
 type constructor struct{}
 
-func (*constructor) New(f *fd.FD) (platform.Platform, error) {
-	return New(f, Config{})
+func (*constructor) New(opts platform.Options) (platform.Platform, error) {
+	log.Infof("UseCPUNums: %v", opts.UseCPUNums)
+	return New(opts.DeviceFile, Config{
+		ApplicationCores: opts.ApplicationCores,
+		UseCPUNums:       opts.UseCPUNums,
+	})
 }
 
 func (*constructor) OpenDevice(devicePath string) (*fd.FD, error) {

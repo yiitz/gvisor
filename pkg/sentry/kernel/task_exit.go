@@ -35,8 +35,9 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
-	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 	"gvisor.dev/gvisor/pkg/waiter"
+
+	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 )
 
 // TaskExitState represents a step in the task exit path.
@@ -100,19 +101,28 @@ func (t *Task) killLocked() {
 	t.interrupt()
 }
 
+// Killed implements context.Blocker.Killed.
+func (t *Task) Killed() bool {
+	if t.killed() {
+		return true
+	}
+	// Indicate that t's task goroutine is still responsive (i.e. reset the
+	// watchdog timer).
+	t.touchGostateTime()
+	return false
+}
+
 // killed returns true if t has a SIGKILL pending. killed is analogous to
 // Linux's fatal_signal_pending().
 //
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) killed() bool {
-	t.tg.signalHandlers.mu.Lock()
-	defer t.tg.signalHandlers.mu.Unlock()
-	return t.killedLocked()
+	return linux.SignalSet(t.pendingSignals.pendingSet.Load())&linux.SignalSetOf(linux.SIGKILL) != 0
 }
 
 // Preconditions: The signal mutex must be locked.
 func (t *Task) killedLocked() bool {
-	return t.pendingSignals.pendingSet&linux.SignalSetOf(linux.SIGKILL) != 0
+	return linux.SignalSet(t.pendingSignals.pendingSet.RacyLoad())&linux.SignalSetOf(linux.SIGKILL) != 0
 }
 
 // PrepareExit indicates an exit with the given status.
@@ -268,9 +278,7 @@ func (*runExitMain) execute(t *Task) taskRunState {
 	// Handle the robust futex list.
 	t.exitRobustList()
 
-	// Deactivate the address space and update max RSS before releasing the
-	// task's MM.
-	t.Deactivate()
+	// Update max RSS before releasing the task's MM.
 	t.tg.pidns.owner.mu.Lock()
 	t.updateRSSLocked()
 	t.tg.pidns.owner.mu.Unlock()
@@ -278,6 +286,7 @@ func (*runExitMain) execute(t *Task) taskRunState {
 	// Release the task image resources. Accessing these fields must be
 	// done with t.mu held, but the mm.DecUsers() call must be done outside
 	// of that lock.
+	t.p.PrepareExit()
 	t.mu.Lock()
 	mm := t.image.MemoryManager
 	t.image.MemoryManager = nil
@@ -288,7 +297,7 @@ func (*runExitMain) execute(t *Task) taskRunState {
 	// Releasing the MM unblocks a blocked CLONE_VFORK parent.
 	t.unstopVforkParent()
 
-	t.fsContext.DecRef(t)
+	t.FSContext().DecRef(t)
 	t.fdTable.DecRef(t)
 
 	// Detach task from all cgroups. This must happen before potentially the
@@ -304,11 +313,16 @@ func (*runExitMain) execute(t *Task) taskRunState {
 	t.ipcns = nil
 	netns := t.netns
 	t.netns = nil
+	childPIDNS := t.childPIDNamespace
+	t.childPIDNamespace = nil
 	t.mu.Unlock()
 	mntns.DecRef(t)
 	utsns.DecRef(t)
 	ipcns.DecRef(t)
 	netns.DecRef(t)
+	if childPIDNS != nil {
+		childPIDNS.DecRef(t)
+	}
 
 	// If this is the last task to exit from the thread group, release the
 	// thread group's resources.
@@ -419,6 +433,10 @@ func (t *Task) findReparentTargetLocked() *Task {
 	// exiting.
 	if t2 := t.tg.anyNonExitingTaskLocked(); t2 != nil {
 		return t2
+	}
+
+	if t.tg.isInitInLocked(t.PIDNamespace()) {
+		return nil // The init process is terminating.
 	}
 
 	if !t.tg.hasChildSubreaper {
@@ -608,7 +626,7 @@ func (*runExitNotify) execute(t *Task) taskRunState {
 		// the sole living task must be the execing one.
 		e := t.tg.execing
 		e.tg.signalHandlers.mu.Lock()
-		if _, ok := e.stop.(*execStop); ok {
+		if _, ok := e.stop.(*siblingExitStop); ok {
 			e.endInternalStopLocked()
 		}
 		e.tg.signalHandlers.mu.Unlock()

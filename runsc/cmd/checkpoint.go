@@ -18,14 +18,16 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/google/subcommands"
-	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/sandbox"
 )
 
 // Checkpoint implements subcommands.Command for the "checkpoint" command.
@@ -34,6 +36,8 @@ type Checkpoint struct {
 	leaveRunning              bool
 	compression               CheckpointCompression
 	excludeCommittedZeroPages bool
+	saveRestoreExecArgv       string
+	saveRestoreExecTimeout    time.Duration
 
 	// direct indicates whether O_DIRECT should be used for writing the
 	// checkpoint pages file. It bypasses the kernel page cache. It is beneficial
@@ -41,6 +45,8 @@ type Checkpoint struct {
 	// For example, if the checkpoint files will be stored on a network block
 	// device, which will be detached after the checkpoint is done.
 	direct bool
+
+	checkpointExtra
 }
 
 // Name implements subcommands.Command.Name.
@@ -65,10 +71,13 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
 	f.Var(newCheckpointCompressionValue(statefile.CompressionLevelDefault, &c.compression), "compression", "compress checkpoint image on disk. Values: none|flate-best-speed.")
 	f.BoolVar(&c.excludeCommittedZeroPages, "exclude-committed-zero-pages", false, "exclude committed zero-filled pages from checkpoint")
 	f.BoolVar(&c.direct, "direct", false, "use O_DIRECT for writing checkpoint pages file")
+	f.StringVar(&c.saveRestoreExecArgv, "save-restore-exec-argv", "", "argv (split by spaces) for a save/restore binary that's automatically executed in the sandbox before saving and after restoring. If the execution fails, the save/restore process will fail.")
+	f.DurationVar(&c.saveRestoreExecTimeout, "save-restore-exec-timeout", control.DefaultSaveRestoreExecTimeout, "timeout for the binary pointed to by save-restore-exec-argv.")
 
 	// Unimplemented flags necessary for compatibility with docker.
 	var wp string
 	f.StringVar(&wp, "work-path", "", "ignored")
+	c.setFlagsExtra(f)
 }
 
 // Execute implements subcommands.Command.Execute.
@@ -94,19 +103,18 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
 		util.Fatalf("making directories at path provided: %v", err)
 	}
 
-	sOpts := statefile.Options{
-		Compression: c.compression.Level(),
+	opts := sandbox.CheckpointOpts{
+		Compression:                c.compression.Level(),
+		Resume:                     c.leaveRunning,
+		Direct:                     c.direct,
+		ExcludeCommittedZeroPages:  c.excludeCommittedZeroPages,
+		SaveRestoreExecArgv:        c.saveRestoreExecArgv,
+		SaveRestoreExecTimeout:     c.saveRestoreExecTimeout,
+		SaveRestoreExecContainerID: id,
 	}
-	mfOpts := pgalloc.SaveOpts{
-		ExcludeCommittedZeroPages: c.excludeCommittedZeroPages,
-	}
+	c.setCheckpointOptsExtra(&opts)
 
-	if c.leaveRunning {
-		// Do not destroy the sandbox after saving.
-		sOpts.Resume = true
-	}
-
-	if err := cont.Checkpoint(c.imagePath, c.direct, sOpts, mfOpts); err != nil {
+	if err := cont.Checkpoint(conf, c.imagePath, opts); err != nil {
 		util.Fatalf("checkpoint failed: %v", err)
 	}
 

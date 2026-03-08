@@ -103,6 +103,7 @@ func (fs *filesystem) StateFields() []string {
 		"vfsfs",
 		"opts",
 		"creds",
+		"createCreds",
 		"dirDevMinor",
 		"lowerDevMinors",
 		"dirInoCache",
@@ -119,11 +120,12 @@ func (fs *filesystem) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &fs.vfsfs)
 	stateSinkObject.Save(1, &fs.opts)
 	stateSinkObject.Save(2, &fs.creds)
-	stateSinkObject.Save(3, &fs.dirDevMinor)
-	stateSinkObject.Save(4, &fs.lowerDevMinors)
-	stateSinkObject.Save(5, &fs.dirInoCache)
-	stateSinkObject.Save(6, &fs.lastDirIno)
-	stateSinkObject.Save(7, &fs.maxFilenameLen)
+	stateSinkObject.Save(3, &fs.createCreds)
+	stateSinkObject.Save(4, &fs.dirDevMinor)
+	stateSinkObject.Save(5, &fs.lowerDevMinors)
+	stateSinkObject.Save(6, &fs.dirInoCache)
+	stateSinkObject.Save(7, &fs.lastDirIno)
+	stateSinkObject.Save(8, &fs.maxFilenameLen)
 }
 
 func (fs *filesystem) afterLoad(context.Context) {}
@@ -133,11 +135,12 @@ func (fs *filesystem) StateLoad(ctx context.Context, stateSourceObject state.Sou
 	stateSourceObject.Load(0, &fs.vfsfs)
 	stateSourceObject.Load(1, &fs.opts)
 	stateSourceObject.Load(2, &fs.creds)
-	stateSourceObject.Load(3, &fs.dirDevMinor)
-	stateSourceObject.Load(4, &fs.lowerDevMinors)
-	stateSourceObject.Load(5, &fs.dirInoCache)
-	stateSourceObject.Load(6, &fs.lastDirIno)
-	stateSourceObject.Load(7, &fs.maxFilenameLen)
+	stateSourceObject.Load(3, &fs.createCreds)
+	stateSourceObject.Load(4, &fs.dirDevMinor)
+	stateSourceObject.Load(5, &fs.lowerDevMinors)
+	stateSourceObject.Load(6, &fs.dirInoCache)
+	stateSourceObject.Load(7, &fs.lastDirIno)
+	stateSourceObject.Load(8, &fs.maxFilenameLen)
 }
 
 func (l *layerDevNumber) StateTypeName() string {
@@ -196,6 +199,34 @@ func (l *layerDevNoAndIno) StateLoad(ctx context.Context, stateSourceObject stat
 	stateSourceObject.Load(1, &l.ino)
 }
 
+func (c *createCredsKey) StateTypeName() string {
+	return "pkg/sentry/fsimpl/overlay.createCredsKey"
+}
+
+func (c *createCredsKey) StateFields() []string {
+	return []string{
+		"uid",
+		"gid",
+	}
+}
+
+func (c *createCredsKey) beforeSave() {}
+
+// +checklocksignore
+func (c *createCredsKey) StateSave(stateSinkObject state.Sink) {
+	c.beforeSave()
+	stateSinkObject.Save(0, &c.uid)
+	stateSinkObject.Save(1, &c.gid)
+}
+
+func (c *createCredsKey) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (c *createCredsKey) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &c.uid)
+	stateSourceObject.Load(1, &c.gid)
+}
+
 func (d *dentry) StateTypeName() string {
 	return "pkg/sentry/fsimpl/overlay.dentry"
 }
@@ -233,8 +264,8 @@ func (d *dentry) beforeSave() {}
 // +checklocksignore
 func (d *dentry) StateSave(stateSinkObject state.Sink) {
 	d.beforeSave()
-	var parentValue *dentry
-	parentValue = d.saveParent()
+	parentValue := d.saveParent()
+	_ = (*dentry)(parentValue)
 	stateSinkObject.SaveValue(7, parentValue)
 	stateSinkObject.Save(0, &d.vfsd)
 	stateSinkObject.Save(1, &d.refs)
@@ -360,6 +391,7 @@ func init() {
 	state.Register((*filesystem)(nil))
 	state.Register((*layerDevNumber)(nil))
 	state.Register((*layerDevNoAndIno)(nil))
+	state.Register((*createCredsKey)(nil))
 	state.Register((*dentry)(nil))
 	state.Register((*fileDescription)(nil))
 	state.Register((*regularFileFD)(nil))

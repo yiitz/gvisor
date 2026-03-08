@@ -20,7 +20,6 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
-	"gvisor.dev/gvisor/pkg/sentry/hostcpu"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -50,7 +49,7 @@ type OldRSeqCriticalRegion struct {
 
 // RSeqAvailable returns true if t supports (old and new) restartable sequences.
 func (t *Task) RSeqAvailable() bool {
-	return t.k.useHostCores && t.k.Platform.DetectsCPUPreemption()
+	return (t.k.useHostCores || t.k.Platform.HasCPUNumbers()) && t.k.Platform.DetectsCPUPreemption()
 }
 
 // SetRSeq registers addr as this thread's rseq structure.
@@ -201,7 +200,7 @@ func (t *Task) rseqUpdateCPU() error {
 		return nil
 	}
 
-	t.rseqCPU = int32(hostcpu.GetCPU())
+	t.rseqCPU = t.CPU()
 
 	// Update both CPUs, even if one fails.
 	rerr := t.rseqCopyOutCPU()
@@ -368,9 +367,7 @@ func (t *Task) rseqAddrInterrupt() {
 	// NOTE(b/143949567): We don't support any rseq flags, so we always
 	// restart if we are in the critical section, and thus *always* clear
 	// critAddrAddr.
-	if _, err := t.MemoryManager().ZeroOut(t, critAddrAddr, int64(t.Arch().Width()), usermem.IOOpts{
-		AddressSpaceActive: true,
-	}); err != nil {
+	if _, err := t.MemoryManager().ZeroOut(t, critAddrAddr, int64(t.Arch().Width()), usermem.IOOpts{}); err != nil {
 		t.Debugf("Failed to clear critical section address from %#x for rseq: %v", critAddrAddr, err)
 		t.forceSignal(linux.SIGSEGV, false /* unconditional */)
 		t.SendSignal(SignalInfoPriv(linux.SIGSEGV))

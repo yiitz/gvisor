@@ -50,10 +50,12 @@ func (m *machine) initArchState() error {
 
 	// Initialize all vCPUs to minimize kvm ioctl-s allowed by seccomp filters.
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	for i := 0; i < m.maxVCPUs; i++ {
-		m.createVCPU(i)
+		if _, err := m.createVCPU(i); err != nil {
+			return err
+		}
 	}
-	m.mu.Unlock()
 
 	return nil
 }
@@ -329,6 +331,28 @@ func loadByte(ptr *byte) byte {
 	return *ptr
 }
 
+func rdDR6() uint64
+func wrDR6(val uint64)
+
+const (
+	// _DR6_RESERVED is a set of reserved bits in DR6 which are always set to 1
+	_DR6_RESERVED = uint64(0xFFFF0FF0)
+
+	_DR_TRAP0 = 0x1    // DR0
+	_DR_TRAP1 = 0x2    // DR1
+	_DR_TRAP2 = 0x4    // DR2
+	_DR_TRAP3 = 0x8    // DR3
+	_DR_STEP  = 0x4000 // single-step
+)
+
+//go:nosplit
+func readAndResetDR6() uint64 {
+	dr6 := rdDR6()
+	wrDR6(_DR6_RESERVED)
+	dr6 ^= _DR6_RESERVED
+	return dr6
+}
+
 // SwitchToUser unpacks architectural-details.
 func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *linux.SignalInfo) (hostarch.AccessType, error) {
 	// Check for canonical addresses.
@@ -370,12 +394,27 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *linux.SignalInfo)
 	case ring0.PageFault:
 		return c.fault(int32(unix.SIGSEGV), info)
 
-	case ring0.Debug, ring0.Breakpoint:
+	case ring0.Debug:
+		bluepill(c)
+		dr6 := readAndResetDR6()
+		code := int32(linux.TRAP_BRKPT)
+		if dr6&_DR_STEP != 0 {
+			code = linux.TRAP_TRACE
+		} else if dr6&(_DR_TRAP0|_DR_TRAP1|_DR_TRAP2|_DR_TRAP3) != 0 {
+			code = linux.TRAP_HWBKPT
+		}
 		*info = linux.SignalInfo{
 			Signo: int32(unix.SIGTRAP),
-			Code:  1, // TRAP_BRKPT (breakpoint).
+			Code:  code,
 		}
 		info.SetAddr(switchOpts.Registers.Rip) // Include address.
+		return hostarch.AccessType{}, platform.ErrContextSignal
+
+	case ring0.Breakpoint:
+		*info = linux.SignalInfo{
+			Signo: int32(unix.SIGTRAP),
+			Code:  linux.SI_KERNEL,
+		}
 		return hostarch.AccessType{}, platform.ErrContextSignal
 
 	case ring0.GeneralProtectionFault,
@@ -458,6 +497,31 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *linux.SignalInfo)
 	}
 }
 
+func (m *machine) mapUpperHalfRegion(
+	pageTable *pagetables.PageTables,
+	virtual uintptr, length uintptr,
+	opts pagetables.MapOpts,
+) {
+	for length != 0 {
+		physical, plength, ok := translateToPhysical(virtual)
+		if !ok || plength == 0 {
+			panic(fmt.Sprintf("impossible translation: virtual %x length %x", virtual, length))
+		}
+		if plength > length {
+			plength = length
+		}
+
+		pageTable.Map(
+			hostarch.Addr(ring0.KernelStartAddress|virtual),
+			plength,
+			opts,
+			physical)
+
+		length -= plength
+		virtual += plength
+	}
+}
+
 func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
 	// Map all the executable regions so that all the entry functions
 	// are mapped in the upper half.
@@ -468,30 +532,16 @@ func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
 
 		if vr.accessType.Execute {
 			r := vr.region
-			physical, length, ok := translateToPhysical(r.virtual)
-			if !ok || length < r.length {
-				panic("impossible translation")
-			}
-			pageTable.Map(
-				hostarch.Addr(ring0.KernelStartAddress|r.virtual),
-				r.length,
-				pagetables.MapOpts{AccessType: hostarch.Execute, Global: true},
-				physical)
+			m.mapUpperHalfRegion(pageTable, r.virtual, r.length,
+				pagetables.MapOpts{AccessType: hostarch.Execute, Global: true})
 		}
 	}); err != nil {
 		panic(fmt.Sprintf("error parsing /proc/self/maps: %v", err))
 	}
 	for start, end := range m.kernel.EntryRegions() {
 		regionLen := end - start
-		physical, length, ok := translateToPhysical(start)
-		if !ok || length < regionLen {
-			panic("impossible translation")
-		}
-		pageTable.Map(
-			hostarch.Addr(ring0.KernelStartAddress|start),
-			regionLen,
-			pagetables.MapOpts{AccessType: hostarch.ReadWrite, Global: true},
-			physical)
+		m.mapUpperHalfRegion(pageTable, start, regionLen,
+			pagetables.MapOpts{AccessType: hostarch.ReadWrite, Global: true})
 	}
 }
 
@@ -499,10 +549,9 @@ func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
 func (m *machine) getMaxVCPU() {
 	maxVCPUs, errno := hostsyscall.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CHECK_EXTENSION, _KVM_CAP_MAX_VCPUS)
 	if errno != 0 {
-		m.maxVCPUs = _KVM_NR_VCPUS
-	} else {
-		m.maxVCPUs = int(maxVCPUs)
+		maxVCPUs = _KVM_NR_VCPUS
 	}
+	m.maxVCPUs = int(maxVCPUs)
 
 	// The goal here is to avoid vCPU contentions for reasonable workloads.
 	// But "reasonable" isn't defined well in this case. Let's say that CPU
@@ -512,6 +561,18 @@ func (m *machine) getMaxVCPU() {
 	rCPUs := runtime.GOMAXPROCS(0)
 	if 3*rCPUs < m.maxVCPUs {
 		m.maxVCPUs = 3 * rCPUs
+	}
+	// However if the sentry is explicitly configured to run more application
+	// cores then we should try our best to give each application thread
+	// its own vCPU, with some room to spare (like above, factor of 2).
+	desiredAppCores := m.applicationCores * 2
+	if m.maxVCPUs < desiredAppCores {
+		if int(maxVCPUs) < desiredAppCores {
+			log.Warningf("ApplicationCores is set too high: set to %d, max on this machine is %d. Your workload may experience unexpected timeouts.", desiredAppCores, maxVCPUs)
+			m.maxVCPUs = int(maxVCPUs)
+		} else {
+			m.maxVCPUs = desiredAppCores
+		}
 	}
 }
 

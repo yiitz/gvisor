@@ -225,7 +225,6 @@ func (mm *MemoryManager) StateFields() []string {
 		"auxv",
 		"executable",
 		"aioManager",
-		"sleepForActivation",
 		"vdsoSigReturnAddr",
 		"membarrierPrivateEnabled",
 		"membarrierRSeqEnabled",
@@ -237,9 +236,6 @@ func (mm *MemoryManager) beforeSave() {}
 // +checklocksignore
 func (mm *MemoryManager) StateSave(stateSinkObject state.Sink) {
 	mm.beforeSave()
-	if !state.IsZeroValue(&mm.active) {
-		state.Failf("active is %#v, expected zero", &mm.active)
-	}
 	if !state.IsZeroValue(&mm.captureInvalidations) {
 		state.Failf("captureInvalidations is %#v, expected zero", &mm.captureInvalidations)
 	}
@@ -261,10 +257,9 @@ func (mm *MemoryManager) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(15, &mm.auxv)
 	stateSinkObject.Save(16, &mm.executable)
 	stateSinkObject.Save(17, &mm.aioManager)
-	stateSinkObject.Save(18, &mm.sleepForActivation)
-	stateSinkObject.Save(19, &mm.vdsoSigReturnAddr)
-	stateSinkObject.Save(20, &mm.membarrierPrivateEnabled)
-	stateSinkObject.Save(21, &mm.membarrierRSeqEnabled)
+	stateSinkObject.Save(18, &mm.vdsoSigReturnAddr)
+	stateSinkObject.Save(19, &mm.membarrierPrivateEnabled)
+	stateSinkObject.Save(20, &mm.membarrierRSeqEnabled)
 }
 
 // +checklocksignore
@@ -287,10 +282,9 @@ func (mm *MemoryManager) StateLoad(ctx context.Context, stateSourceObject state.
 	stateSourceObject.Load(15, &mm.auxv)
 	stateSourceObject.Load(16, &mm.executable)
 	stateSourceObject.Load(17, &mm.aioManager)
-	stateSourceObject.Load(18, &mm.sleepForActivation)
-	stateSourceObject.Load(19, &mm.vdsoSigReturnAddr)
-	stateSourceObject.Load(20, &mm.membarrierPrivateEnabled)
-	stateSourceObject.Load(21, &mm.membarrierRSeqEnabled)
+	stateSourceObject.Load(18, &mm.vdsoSigReturnAddr)
+	stateSourceObject.Load(19, &mm.membarrierPrivateEnabled)
+	stateSourceObject.Load(20, &mm.membarrierRSeqEnabled)
 	stateSourceObject.AfterLoad(func() { mm.afterLoad(ctx) })
 }
 
@@ -319,8 +313,8 @@ func (v *vma) beforeSave() {}
 // +checklocksignore
 func (v *vma) StateSave(stateSinkObject state.Sink) {
 	v.beforeSave()
-	var realPermsValue int
-	realPermsValue = v.saveRealPerms()
+	realPermsValue := v.saveRealPerms()
+	_ = (int)(realPermsValue)
 	stateSinkObject.SaveValue(2, realPermsValue)
 	stateSinkObject.Save(0, &v.mappable)
 	stateSinkObject.Save(1, &v.off)
@@ -373,8 +367,8 @@ func (p *pma) beforeSave() {}
 // +checklocksignore
 func (p *pma) StateSave(stateSinkObject state.Sink) {
 	p.beforeSave()
-	var fileValue string
-	fileValue = p.saveFile()
+	fileValue := p.saveFile()
+	_ = (string)(fileValue)
 	stateSinkObject.SaveValue(0, fileValue)
 	stateSinkObject.Save(1, &p.off)
 	stateSinkObject.Save(2, &p.translatePerms)
@@ -414,8 +408,8 @@ func (s *pmaSet) beforeSave() {}
 // +checklocksignore
 func (s *pmaSet) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
-	var rootValue []pmaFlatSegment
-	rootValue = s.saveRoot()
+	rootValue := s.saveRoot()
+	_ = ([]pmaFlatSegment)(rootValue)
 	stateSinkObject.SaveValue(0, rootValue)
 }
 
@@ -572,8 +566,8 @@ func (s *vmaSet) beforeSave() {}
 // +checklocksignore
 func (s *vmaSet) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
-	var rootValue []vmaFlatSegment
-	rootValue = s.saveRoot()
+	rootValue := s.saveRoot()
+	_ = ([]vmaFlatSegment)(rootValue)
 	stateSinkObject.SaveValue(0, rootValue)
 }
 

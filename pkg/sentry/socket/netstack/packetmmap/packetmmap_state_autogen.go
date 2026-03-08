@@ -19,15 +19,13 @@ func (m *Endpoint) StateFields() []string {
 		"mapped",
 		"mode",
 		"cooked",
+		"stack",
 		"packetEP",
 		"reserve",
-		"nicID",
-		"netProto",
 		"version",
 		"headerLen",
 		"received",
 		"dropped",
-		"stack",
 		"wq",
 		"mappings",
 	}
@@ -43,17 +41,15 @@ func (m *Endpoint) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(2, &m.mapped)
 	stateSinkObject.Save(3, &m.mode)
 	stateSinkObject.Save(4, &m.cooked)
-	stateSinkObject.Save(5, &m.packetEP)
-	stateSinkObject.Save(6, &m.reserve)
-	stateSinkObject.Save(7, &m.nicID)
-	stateSinkObject.Save(8, &m.netProto)
-	stateSinkObject.Save(9, &m.version)
-	stateSinkObject.Save(10, &m.headerLen)
-	stateSinkObject.Save(11, &m.received)
-	stateSinkObject.Save(12, &m.dropped)
-	stateSinkObject.Save(13, &m.stack)
-	stateSinkObject.Save(14, &m.wq)
-	stateSinkObject.Save(15, &m.mappings)
+	stateSinkObject.Save(5, &m.stack)
+	stateSinkObject.Save(6, &m.packetEP)
+	stateSinkObject.Save(7, &m.reserve)
+	stateSinkObject.Save(8, &m.version)
+	stateSinkObject.Save(9, &m.headerLen)
+	stateSinkObject.Save(10, &m.received)
+	stateSinkObject.Save(11, &m.dropped)
+	stateSinkObject.Save(12, &m.wq)
+	stateSinkObject.Save(13, &m.mappings)
 }
 
 func (m *Endpoint) afterLoad(context.Context) {}
@@ -65,17 +61,15 @@ func (m *Endpoint) StateLoad(ctx context.Context, stateSourceObject state.Source
 	stateSourceObject.Load(2, &m.mapped)
 	stateSourceObject.Load(3, &m.mode)
 	stateSourceObject.Load(4, &m.cooked)
-	stateSourceObject.Load(5, &m.packetEP)
-	stateSourceObject.Load(6, &m.reserve)
-	stateSourceObject.Load(7, &m.nicID)
-	stateSourceObject.Load(8, &m.netProto)
-	stateSourceObject.Load(9, &m.version)
-	stateSourceObject.Load(10, &m.headerLen)
-	stateSourceObject.Load(11, &m.received)
-	stateSourceObject.Load(12, &m.dropped)
-	stateSourceObject.Load(13, &m.stack)
-	stateSourceObject.Load(14, &m.wq)
-	stateSourceObject.Load(15, &m.mappings)
+	stateSourceObject.Load(5, &m.stack)
+	stateSourceObject.Load(6, &m.packetEP)
+	stateSourceObject.Load(7, &m.reserve)
+	stateSourceObject.Load(8, &m.version)
+	stateSourceObject.Load(9, &m.headerLen)
+	stateSourceObject.Load(10, &m.received)
+	stateSourceObject.Load(11, &m.dropped)
+	stateSourceObject.Load(12, &m.wq)
+	stateSourceObject.Load(13, &m.mappings)
 }
 
 func (rb *ringBuffer) StateTypeName() string {
@@ -88,8 +82,6 @@ func (rb *ringBuffer) StateFields() []string {
 		"frameSize",
 		"frameMax",
 		"blockSize",
-		"numBlocks",
-		"version",
 		"head",
 		"rxOwnerMap",
 		"size",
@@ -107,13 +99,11 @@ func (rb *ringBuffer) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(1, &rb.frameSize)
 	stateSinkObject.Save(2, &rb.frameMax)
 	stateSinkObject.Save(3, &rb.blockSize)
-	stateSinkObject.Save(4, &rb.numBlocks)
-	stateSinkObject.Save(5, &rb.version)
-	stateSinkObject.Save(6, &rb.head)
-	stateSinkObject.Save(7, &rb.rxOwnerMap)
-	stateSinkObject.Save(8, &rb.size)
-	stateSinkObject.Save(9, &rb.mapping)
-	stateSinkObject.Save(10, &rb.data)
+	stateSinkObject.Save(4, &rb.head)
+	stateSinkObject.Save(5, &rb.rxOwnerMap)
+	stateSinkObject.Save(6, &rb.size)
+	stateSinkObject.Save(7, &rb.mapping)
+	stateSinkObject.Save(8, &rb.data)
 }
 
 // +checklocksignore
@@ -122,13 +112,11 @@ func (rb *ringBuffer) StateLoad(ctx context.Context, stateSourceObject state.Sou
 	stateSourceObject.Load(1, &rb.frameSize)
 	stateSourceObject.Load(2, &rb.frameMax)
 	stateSourceObject.Load(3, &rb.blockSize)
-	stateSourceObject.Load(4, &rb.numBlocks)
-	stateSourceObject.Load(5, &rb.version)
-	stateSourceObject.Load(6, &rb.head)
-	stateSourceObject.Load(7, &rb.rxOwnerMap)
-	stateSourceObject.Load(8, &rb.size)
-	stateSourceObject.Load(9, &rb.mapping)
-	stateSourceObject.Load(10, &rb.data)
+	stateSourceObject.Load(4, &rb.head)
+	stateSourceObject.Load(5, &rb.rxOwnerMap)
+	stateSourceObject.Load(6, &rb.size)
+	stateSourceObject.Load(7, &rb.mapping)
+	stateSourceObject.Load(8, &rb.data)
 	stateSourceObject.AfterLoad(func() { rb.afterLoad(ctx) })
 }
 

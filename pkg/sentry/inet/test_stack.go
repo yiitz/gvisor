@@ -61,7 +61,7 @@ func (s *TestStack) Destroy() {
 }
 
 // RemoveInterface implements Stack.
-func (s *TestStack) RemoveInterface(idx int32) error {
+func (s *TestStack) RemoveInterface(ctx context.Context, idx int32) error {
 	delete(s.InterfacesMap, idx)
 	return nil
 }
@@ -240,4 +240,15 @@ func (*TestStack) IsSaveRestoreEnabled() bool {
 func (*TestStack) Stats() tcpip.Stats {
 	// No-op.
 	return tcpip.Stats{}
+}
+
+// SetRemoveConf implements Stack.
+func (*TestStack) SetRemoveConf(bool) {
+	// No-op.
+}
+
+// GetRemoveConf implements Stack.
+func (*TestStack) GetRemoveConf() bool {
+	// No-op.
+	return false
 }

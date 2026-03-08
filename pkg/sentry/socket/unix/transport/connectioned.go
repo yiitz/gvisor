@@ -106,6 +106,14 @@ type connectionedEndpoint struct {
 	// tcpip.SockStream.
 	stype linux.SockType
 
+	// peerCreds is used to store the peer credentials.
+	// This will store the socket's own credentials until the connection is
+	// established with connect(2). Once the connection is established, this
+	// will store the peer's credentials. The use of this option is possible
+	// only for connected `AF_UNIX` stream sockets and for `AF_UNIX` stream and
+	// datagram socket pairs created using socketpair(2)
+	peerCreds CredentialsControlMessage
+
 	// acceptedChan is per the TCP endpoint implementation. Note that the
 	// sockets in this channel are _already in the connected state_, and
 	// have another associated connectionedEndpoint.
@@ -260,6 +268,21 @@ func (e *connectionedEndpoint) Close(ctx context.Context) {
 	e.Unlock()
 	if acceptedChan != nil {
 		for n := range acceptedChan {
+			// When listener is closed, pending connections should receive
+			// ECONNRESET instead of EOF to match Linux behavior.
+			n.Lock()
+			if n.connected != nil {
+				// Try to set SO_ERROR on the client endpoint so that
+				// getsockopt(SO_ERROR) or read() returns ECONNRESET.
+				if ce, ok := n.connected.(*connectedEndpoint); ok {
+					if clientEP, ok := ce.endpoint.(*connectionedEndpoint); ok {
+						clientEP.SocketOptions().SetLastError(&tcpip.ErrConnectionReset{})
+						// Notify waiter queue about error events so epoll detects EPOLLERR.
+						clientEP.Queue.Notify(waiter.EventErr)
+					}
+				}
+			}
+			n.Unlock()
 			n.Close(ctx)
 		}
 	}
@@ -274,8 +297,18 @@ func (e *connectionedEndpoint) Close(ctx context.Context) {
 	}
 }
 
+func (e *connectionedEndpoint) swapPeerCredsLocked(ctx context.Context, cend ConnectingEndpoint, ne *connectionedEndpoint) *syserr.Error {
+	ce, ok := cend.(*connectionedEndpoint)
+	if !ok {
+		return syserr.ErrInvalidEndpointState
+	}
+	// Swap peer credentials between the two endpoints.
+	ne.peerCreds, ce.peerCreds = ce.peerCreds, ne.peerCreds
+	return nil
+}
+
 // BidirectionalConnect implements BoundEndpoint.BidirectionalConnect.
-func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce ConnectingEndpoint, returnConnect func(Receiver, ConnectedEndpoint), opts UnixSocketOpts) *syserr.Error {
+func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce ConnectingEndpoint, returnConnect func(Receiver, ConnectedEndpoint)) *syserr.Error {
 	if ce.Type() != e.stype {
 		return syserr.ErrWrongProtocolForSocket
 	}
@@ -327,6 +360,7 @@ func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce Conn
 	ne.ops.SetSendBufferSize(defaultBufferSize, false /* notify */)
 	ne.ops.SetReceiveBufferSize(defaultBufferSize, false /* notify */)
 	ne.SocketOptions().SetPassCred(e.SocketOptions().GetPassCred())
+	ne.peerCreds = e.peerCreds
 
 	readQueue := &queue{ReaderQueue: ce.WaiterQueue(), WriterQueue: ne.Queue, limit: defaultBufferSize}
 	readQueue.InitRefs()
@@ -354,6 +388,9 @@ func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce Conn
 		}
 		readQueue.IncRef()
 		if e.stype == linux.SOCK_STREAM {
+			if err := e.swapPeerCredsLocked(ctx, ce, ne); err != nil {
+				return err
+			}
 			returnConnect(&streamQueueReceiver{queueReceiver: queueReceiver{readQueue: readQueue}}, connected)
 		} else {
 			returnConnect(&queueReceiver{readQueue: readQueue}, connected)
@@ -378,13 +415,13 @@ func (e *connectionedEndpoint) BidirectionalConnect(ctx context.Context, ce Conn
 }
 
 // UnidirectionalConnect implements BoundEndpoint.UnidirectionalConnect.
-func (e *connectionedEndpoint) UnidirectionalConnect(ctx context.Context, opts UnixSocketOpts) (ConnectedEndpoint, *syserr.Error) {
+func (e *connectionedEndpoint) UnidirectionalConnect(ctx context.Context) (ConnectedEndpoint, *syserr.Error) {
 	return nil, syserr.ErrConnectionRefused
 }
 
 // Connect attempts to directly connect to another Endpoint.
 // Implements Endpoint.Connect.
-func (e *connectionedEndpoint) Connect(ctx context.Context, server BoundEndpoint, opts UnixSocketOpts) *syserr.Error {
+func (e *connectionedEndpoint) Connect(ctx context.Context, server BoundEndpoint) *syserr.Error {
 	returnConnect := func(r Receiver, ce ConnectedEndpoint) {
 		e.receiver = r
 		e.connected = ce
@@ -396,7 +433,7 @@ func (e *connectionedEndpoint) Connect(ctx context.Context, server BoundEndpoint
 		}
 	}
 
-	return server.BidirectionalConnect(ctx, e, returnConnect, opts)
+	return server.BidirectionalConnect(ctx, e, returnConnect)
 }
 
 // Listen starts listening on the connection.
@@ -438,7 +475,7 @@ func (e *connectionedEndpoint) Listen(ctx context.Context, backlog int) *syserr.
 }
 
 // Accept accepts a new connection.
-func (e *connectionedEndpoint) Accept(ctx context.Context, peerAddr *Address, opts UnixSocketOpts) (Endpoint, *syserr.Error) {
+func (e *connectionedEndpoint) Accept(ctx context.Context, peerAddr *Address) (Endpoint, *syserr.Error) {
 	e.Lock()
 
 	if !e.ListeningLocked() {
@@ -446,7 +483,7 @@ func (e *connectionedEndpoint) Accept(ctx context.Context, peerAddr *Address, op
 		return nil, syserr.ErrInvalidEndpointState
 	}
 
-	ne, err := e.getAcceptedEndpointLocked(ctx, opts)
+	ne, err := e.getAcceptedEndpointLocked(ctx)
 	e.Unlock()
 	if err != nil {
 		return nil, err
@@ -470,7 +507,7 @@ func (e *connectionedEndpoint) Accept(ctx context.Context, peerAddr *Address, op
 // Preconditions:
 //   - e.Listening()
 //   - e is locked.
-func (e *connectionedEndpoint) getAcceptedEndpointLocked(ctx context.Context, opts UnixSocketOpts) (*connectionedEndpoint, *syserr.Error) {
+func (e *connectionedEndpoint) getAcceptedEndpointLocked(ctx context.Context) (*connectionedEndpoint, *syserr.Error) {
 	// Accept connections from within the sentry first, since this avoids
 	// an RPC to the gofer on the common path.
 	select {
@@ -493,7 +530,7 @@ func (e *connectionedEndpoint) getAcceptedEndpointLocked(ctx context.Context, op
 		return nil, syserr.FromError(err)
 	}
 	q := &waiter.Queue{}
-	scme, serr := NewSCMEndpoint(nfd, q, e.path, opts)
+	scme, serr := NewSCMEndpoint(nfd, q, e.path)
 	if serr != nil {
 		unix.Close(nfd)
 		return nil, serr
@@ -565,6 +602,15 @@ func (e *connectionedEndpoint) Readiness(mask waiter.EventMask) waiter.EventMask
 			ready |= waiter.EventRdHUp
 			if mask&waiter.EventHUp != 0 && e.connected.IsSendClosed() {
 				ready |= waiter.EventHUp
+			}
+		}
+		// Check for error condition (SO_ERROR is set).
+		if mask&waiter.EventErr != 0 {
+			e.lastErrorMu.Lock()
+			hasError := e.lastError != nil
+			e.lastErrorMu.Unlock()
+			if hasError {
+				ready |= waiter.EventErr
 			}
 		}
 	case e.ListeningLocked():
@@ -654,4 +700,16 @@ func (e *connectionedEndpoint) EventUnregister(we *waiter.Entry) {
 
 func (e *connectionedEndpoint) GetAcceptConn() bool {
 	return e.Listening()
+}
+
+func (e *connectionedEndpoint) PeerCreds() CredentialsControlMessage {
+	e.Lock()
+	defer e.Unlock()
+	return e.peerCreds
+}
+
+func (e *connectionedEndpoint) SetPeerCreds(creds CredentialsControlMessage) {
+	e.Lock()
+	defer e.Unlock()
+	e.peerCreds = creds
 }

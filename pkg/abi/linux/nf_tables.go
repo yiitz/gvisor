@@ -16,6 +16,20 @@ package linux
 
 // This file contains constants required to support nf_tables.
 
+const NFT_MAX_HOOKS = NF_INET_NUMHOOKS + 1
+
+// Name length constants for nf_table structures. These correspond to values in
+// include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFT_NAME_MAXLEN      = 256
+	NFT_TABLE_MAXNAMELEN = NFT_NAME_MAXLEN
+	NFT_CHAIN_MAXNAMELEN = NFT_NAME_MAXLEN
+	NFT_SET_MAXNAMELEN   = NFT_NAME_MAXLEN
+	NFT_OBJ_MAXNAMELEN   = NFT_NAME_MAXLEN
+	NFT_USERDATA_MAXLEN  = 256
+	NFT_OSF_MAXGENRELEN  = 16
+)
+
 // 16-byte Registers that can be used to maintain state for rules.
 // These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
 const (
@@ -81,6 +95,263 @@ const (
 	NFT_RETURN int32 = -5
 )
 
+// NfTableMsgType values map to operations within the nftables api.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+type NfTableMsgType uint16
+
+// Netlink Netfilter table message types.
+const (
+	NFT_MSG_NEWTABLE NfTableMsgType = iota
+	NFT_MSG_GETTABLE
+	NFT_MSG_DELTABLE
+	NFT_MSG_NEWCHAIN
+	NFT_MSG_GETCHAIN
+	NFT_MSG_DELCHAIN
+	NFT_MSG_NEWRULE
+	NFT_MSG_GETRULE
+	NFT_MSG_DELRULE
+	NFT_MSG_NEWSET
+	NFT_MSG_GETSET
+	NFT_MSG_DELSET
+	NFT_MSG_NEWSETELEM
+	NFT_MSG_GETSETELEM
+	NFT_MSG_DELSETELEM
+	NFT_MSG_NEWGEN
+	NFT_MSG_GETGEN
+	NFT_MSG_TRACE
+	NFT_MSG_NEWOBJ
+	NFT_MSG_GETOBJ
+	NFT_MSG_DELOBJ
+	NFT_MSG_GETOBJ_RESET
+	NFT_MSG_NEWFLOWTABLE
+	NFT_MSG_GETFLOWTABLE
+	NFT_MSG_DELFLOWTABLE
+	NFT_MSG_GETRULE_RESET
+	NFT_MSG_DESTROYTABLE
+	NFT_MSG_DESTROYCHAIN
+	NFT_MSG_DESTROYRULE
+	NFT_MSG_DESTROYSET
+	NFT_MSG_DESTROYSETELEM
+	NFT_MSG_DESTROYOBJ
+	NFT_MSG_DESTROYFLOWTABLE
+	NFT_MSG_GETSETELEM_RESET
+	NFT_MSG_MAX
+)
+
+var nfTableMsgTypeStrings = [...]string{
+	NFT_MSG_NEWTABLE:         "NFT_MSG_NEWTABLE",
+	NFT_MSG_GETTABLE:         "NFT_MSG_GETTABLE",
+	NFT_MSG_DELTABLE:         "NFT_MSG_DELTABLE",
+	NFT_MSG_NEWCHAIN:         "NFT_MSG_NEWCHAIN",
+	NFT_MSG_GETCHAIN:         "NFT_MSG_GETCHAIN",
+	NFT_MSG_DELCHAIN:         "NFT_MSG_DELCHAIN",
+	NFT_MSG_NEWRULE:          "NFT_MSG_NEWRULE",
+	NFT_MSG_GETRULE:          "NFT_MSG_GETRULE",
+	NFT_MSG_DELRULE:          "NFT_MSG_DELRULE",
+	NFT_MSG_NEWSET:           "NFT_MSG_NEWSET",
+	NFT_MSG_GETSET:           "NFT_MSG_GETSET",
+	NFT_MSG_DELSET:           "NFT_MSG_DELSET",
+	NFT_MSG_NEWSETELEM:       "NFT_MSG_NEWSETELEM",
+	NFT_MSG_GETSETELEM:       "NFT_MSG_GETSETELEM",
+	NFT_MSG_DELSETELEM:       "NFT_MSG_DELSETELEM",
+	NFT_MSG_NEWGEN:           "NFT_MSG_NEWGEN",
+	NFT_MSG_GETGEN:           "NFT_MSG_GETGEN",
+	NFT_MSG_TRACE:            "NFT_MSG_TRACE",
+	NFT_MSG_NEWOBJ:           "NFT_MSG_NEWOBJ",
+	NFT_MSG_GETOBJ:           "NFT_MSG_GETOBJ",
+	NFT_MSG_DELOBJ:           "NFT_MSG_DELOBJ",
+	NFT_MSG_GETOBJ_RESET:     "NFT_MSG_GETOBJ_RESET",
+	NFT_MSG_NEWFLOWTABLE:     "NFT_MSG_NEWFLOWTABLE",
+	NFT_MSG_GETFLOWTABLE:     "NFT_MSG_GETFLOWTABLE",
+	NFT_MSG_DELFLOWTABLE:     "NFT_MSG_DELFLOWTABLE",
+	NFT_MSG_GETRULE_RESET:    "NFT_MSG_GETRULE_RESET",
+	NFT_MSG_DESTROYTABLE:     "NFT_MSG_DESTROYTABLE",
+	NFT_MSG_DESTROYCHAIN:     "NFT_MSG_DESTROYCHAIN",
+	NFT_MSG_DESTROYRULE:      "NFT_MSG_DESTROYRULE",
+	NFT_MSG_DESTROYSET:       "NFT_MSG_DESTROYSET",
+	NFT_MSG_DESTROYSETELEM:   "NFT_MSG_DESTROYSETELEM",
+	NFT_MSG_DESTROYOBJ:       "NFT_MSG_DESTROYOBJ",
+	NFT_MSG_DESTROYFLOWTABLE: "NFT_MSG_DESTROYFLOWTABLE",
+	NFT_MSG_GETSETELEM_RESET: "NFT_MSG_GETSETELEM_RESET",
+	NFT_MSG_MAX:              "NFT_MSG_MAX",
+}
+
+// String returns the string representation of the NfTableMsgType.
+func (msg NfTableMsgType) String() string {
+	if int(msg) < len(nfTableMsgTypeStrings) {
+		return nfTableMsgTypeStrings[msg]
+	}
+	return "UNKNOWN"
+}
+
+// NfTableListAttributes represents the netfilter attributes for lists of data.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_LIST_UNSPEC uint16 = iota
+	NFTA_LIST_ELEM
+	__NFTA_LIST_MAX
+	NFTA_LIST_MAX = __NFTA_LIST_MAX - 1
+)
+
+// NfTableHookAttributes represents the netfilter hook attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_HOOK_UNSPEC uint16 = iota
+	NFTA_HOOK_HOOKNUM
+	NFTA_HOOK_PRIORITY
+	NFTA_HOOK_DEV
+	NFTA_HOOK_DEVS
+	__NFTA_HOOK_MAX
+	NFTA_HOOK_MAX = __NFTA_HOOK_MAX - 1
+)
+
+// NfTableFlags represents table flags that can be set for a table, namely dormant.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFT_TABLE_F_DORMANT uint32 = 0x1
+	NFT_TABLE_F_OWNER          = 0x2
+	NFT_TABLE_F_PERSIST        = 0x4
+	NFT_TABLE_F_MASK           = NFT_TABLE_F_DORMANT | NFT_TABLE_F_OWNER | NFT_TABLE_F_PERSIST
+)
+
+// NfTableAttributes represents the netfilter table attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_TABLE_UNSPEC uint16 = iota
+	NFTA_TABLE_NAME
+	NFTA_TABLE_FLAGS
+	NFTA_TABLE_USE
+	NFTA_TABLE_HANDLE
+	NFTA_TABLE_PAD
+	NFTA_TABLE_USERDATA
+	NFTA_TABLE_OWNER
+	__NFTA_TABLE_MAX
+)
+
+// NFTA_TABLE_MAX is the maximum netfilter table attribute.
+const NFTA_TABLE_MAX = __NFTA_TABLE_MAX - 1
+
+// NfTableChainFlags represents chain flags that can be set for a chain.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFT_CHAIN_BASE       uint32 = (1 << 0)
+	NFT_CHAIN_HW_OFFLOAD        = (1 << 1)
+	NFT_CHAIN_BINDING           = (1 << 2)
+	NFT_CHAIN_FLAGS             = (NFT_CHAIN_BASE | NFT_CHAIN_HW_OFFLOAD | NFT_CHAIN_BINDING)
+)
+
+// NfTableChainAttributes represents the netfilter chain attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_CHAIN_UNSPEC uint16 = iota
+	NFTA_CHAIN_TABLE
+	NFTA_CHAIN_HANDLE
+	NFTA_CHAIN_NAME
+	NFTA_CHAIN_HOOK
+	NFTA_CHAIN_POLICY
+	NFTA_CHAIN_USE
+	NFTA_CHAIN_TYPE
+	NFTA_CHAIN_COUNTERS
+	NFTA_CHAIN_PAD
+	NFTA_CHAIN_FLAGS
+	NFTA_CHAIN_ID
+	NFTA_CHAIN_USERDATA
+	__NFTA_CHAIN_MAX
+	NFTA_CHAIN_MAX = __NFTA_CHAIN_MAX - 1
+)
+
+// NfTableRuleAttributes represents the netfilter rule attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_RULE_UNSPEC uint16 = iota
+	NFTA_RULE_TABLE
+	NFTA_RULE_CHAIN
+	NFTA_RULE_HANDLE
+	NFTA_RULE_EXPRESSIONS
+	NFTA_RULE_COMPAT
+	NFTA_RULE_POSITION
+	NFTA_RULE_USERDATA
+	NFTA_RULE_PAD
+	NFTA_RULE_ID
+	NFTA_RULE_POSITION_ID
+	NFTA_RULE_CHAIN_ID
+	__NFTA_RULE_MAX
+	NFTA_RULE_MAX = __NFTA_RULE_MAX - 1
+)
+
+// NfTableDataTypes represents the netfilter data types.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFT_DATA_VALUE   = iota
+	NFT_DATA_VERDICT = 0xffffff00
+)
+
+// NfTableDataReservedMask represents the netfilter data reserved mask for internally used types.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFT_DATA_RESERVED_MASK = 0xffffff00
+)
+
+// NfTableDataAttributes represents the netfilter data attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_DATA_UNSPEC uint16 = iota
+	NFTA_DATA_VALUE
+	NFTA_DATA_VERDICT
+	__NFTA_DATA_MAX
+	NFTA_DATA_MAX = __NFTA_DATA_MAX - 1
+)
+
+// NFT_DATA_VALUE_MAXLEN is the maximum length of a netfilter data value.
+const NFT_DATA_VALUE_MAXLEN = 64
+
+// NfTableVerdictAttributes represents the netfilter verdict attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_VERDICT_UNSPEC uint16 = iota
+	NFTA_VERDICT_CODE
+	NFTA_VERDICT_CHAIN
+	NFTA_VERDICT_CHAIN_ID
+	__NFTA_VERDICT_MAX
+	NFTA_VERDICT_MAX = __NFTA_VERDICT_MAX - 1
+)
+
+// NfTableExprAttributes represents the netfilter expression attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_EXPR_UNSPEC uint16 = iota
+	NFTA_EXPR_NAME
+	NFTA_EXPR_DATA
+	__NFTA_EXPR_MAX
+	NFTA_EXPR_MAX = __NFTA_EXPR_MAX - 1
+)
+
+// NfTableImmediateAttributes represents the netfilter immediate attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_IMMEDIATE_UNSPEC uint16 = iota
+	NFTA_IMMEDIATE_DREG
+	NFTA_IMMEDIATE_DATA
+	__NFTA_IMMEDIATE_MAX
+	NFTA_IMMEDIATE_MAX = __NFTA_IMMEDIATE_MAX - 1
+)
+
+// NfTablePayloadAttributes represents the netfilter payload attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_PAYLOAD_UNSPEC uint16 = iota
+	NFTA_PAYLOAD_DREG
+	NFTA_PAYLOAD_BASE
+	NFTA_PAYLOAD_OFFSET
+	NFTA_PAYLOAD_LEN
+	NFTA_PAYLOAD_SREG
+	NFTA_PAYLOAD_CSUM_TYPE
+	NFTA_PAYLOAD_CSUM_OFFSET
+	NFTA_PAYLOAD_CSUM_FLAGS
+	__NFTA_PAYLOAD_MAX
+	NFTA_PAYLOAD_MAX = __NFTA_PAYLOAD_MAX - 1
+)
+
 // Nf table relational operators.
 // Used by the nft comparison operation to compare values in registers.
 // These correspond to enum values in include/uapi/linux/netfilter/nf_tables.h.
@@ -91,6 +362,17 @@ const (
 	NFT_CMP_LTE        // less than or equal to
 	NFT_CMP_GT         // greater than
 	NFT_CMP_GTE        // greater than or equal to
+)
+
+// Nf table cmp expression netlink attributes.
+// These correspond to enum values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_CMP_UNSPEC uint16 = iota
+	NFTA_CMP_SREG
+	NFTA_CMP_OP
+	NFTA_CMP_DATA
+	__NFTA_CMP_MAX
+	NFTA_CMP_MAX = __NFTA_CMP_MAX - 1
 )
 
 // Nf table range operators.
@@ -206,4 +488,37 @@ const (
 	NFT_META_SDIF                 // Slave device interface index
 	NFT_META_SDIFNAME             // Slave device interface name
 	NFT_META_BRI_BROUTE           // Packet br_netfilter_broute bit
+)
+
+// Nf table meta expression netlink attributes
+// These correspond to enum values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_META_UNSPEC = iota
+	NFTA_META_DREG
+	NFTA_META_KEY
+	NFTA_META_SREG
+	__NFTA_META_MAX
+	NFTA_META_MAX = __NFTA_META_MAX - 1
+)
+
+// Nf table counter expression netlink attributes.
+// These correspond to enum values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_COUNTER_UNSPEC = iota
+	NFTA_COUNTER_BYTES
+	NFTA_COUNTER_PACKETS
+	NFTA_COUNTER_PAD
+	__NFTA_COUNTER_MAX
+	NFTA_COUNTER_MAX = __NFTA_COUNTER_MAX - 1
+)
+
+// Nftables Generation Attributes
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_GEN_UNSPEC uint16 = iota
+	NFTA_GEN_ID
+	NFTA_GEN_PROC_PID
+	NFTA_GEN_PROC_NAME
+	__NFTA_GEN_MAX
+	NFTA_GEN_MAX = __NFTA_GEN_MAX - 1
 )

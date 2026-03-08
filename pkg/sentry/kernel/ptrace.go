@@ -123,7 +123,7 @@ func (t *Task) CanTrace(target *Task, attach bool) bool {
 		return false
 	}
 
-	if t.k.YAMAPtraceScope.Load() == linux.YAMA_SCOPE_RELATIONAL {
+	if attach && t.k.YAMAPtraceScope.Load() == linux.YAMA_SCOPE_RELATIONAL {
 		t.tg.pidns.owner.mu.RLock()
 		defer t.tg.pidns.owner.mu.RUnlock()
 		if !t.canTraceYAMALocked(target) {
@@ -144,7 +144,7 @@ func (t *Task) canTraceLocked(target *Task, attach bool) bool {
 		return false
 	}
 
-	if t.k.YAMAPtraceScope.Load() == linux.YAMA_SCOPE_RELATIONAL {
+	if attach && t.k.YAMAPtraceScope.Load() == linux.YAMA_SCOPE_RELATIONAL {
 		if !t.canTraceYAMALocked(target) {
 			return false
 		}
@@ -361,7 +361,7 @@ func (t *Task) beginPtraceStopLocked() bool {
 	// This is analogous to Linux's kernel/signal.c:ptrace_stop() => ... =>
 	// kernel/sched/core.c:__schedule() => signal_pending_state() check, which
 	// is what prevents tasks from entering ptrace-stops after being killed.
-	// Note that if t was SIGKILLed and beingPtraceStopLocked is being called
+	// Note that if t was SIGKILLed and beginPtraceStopLocked is being called
 	// for PTRACE_EVENT_EXIT, the task will have dequeued the signal before
 	// entering the exit path, so t.killedLocked() will no longer return true.
 	// This is consistent with Linux: "Bugs: ... A SIGKILL signal may still
@@ -501,9 +501,6 @@ func (t *Task) ptraceTraceme() error {
 // ptraceAttach implements ptrace(PTRACE_ATTACH, target) if seize is false, and
 // ptrace(PTRACE_SEIZE, target, 0, opts) if seize is true. t is the caller.
 func (t *Task) ptraceAttach(target *Task, seize bool, opts uintptr) error {
-	if t.tg == target.tg {
-		return linuxerr.EPERM
-	}
 	t.tg.pidns.owner.mu.Lock()
 	defer t.tg.pidns.owner.mu.Unlock()
 	if !t.canTraceLocked(target, true) {
@@ -1002,7 +999,60 @@ func (t *Task) ptraceSetOptionsLocked(opts uintptr) error {
 	return nil
 }
 
-// Ptrace implements the ptrace system call.
+// PtraceAttach implements PTRACE_ATTACH and PTRACE_SEIZE.
+func (t *Task) PtraceAttach(req int64, pid ThreadID, addr, data hostarch.Addr) (*SyscallControl, error) {
+	target := t.tg.pidns.TaskWithID(pid)
+	if target == nil {
+		return nil, linuxerr.ESRCH
+	}
+	seize := req == linux.PTRACE_SEIZE
+	if seize && addr != 0 {
+		return nil, linuxerr.EIO
+	}
+	if t.tg == target.tg {
+		return nil, linuxerr.EPERM
+	}
+
+	// Serialize with execve(2) to ensure correct creds computation in execve(2),
+	// see Task.shouldStopPrivGainDueToPtracerLocked().
+	t.execveCredsMutexStartLock(target.tg)
+	r := runPtraceAfterExecveCredsLock{
+		target: target,
+		seize:  seize,
+		data:   data,
+	}
+	return &SyscallControl{next: &r, ignoreReturn: false}, nil
+}
+
+// The runPtraceAfterExecveCredsLock state continues PTRACE_ATTACH and PTRACE_SEIZE after
+// the lock that serializes them with execve has been acquired.
+//
+// +stateify savable
+type runPtraceAfterExecveCredsLock struct {
+	target *Task
+	seize  bool
+	data   hostarch.Addr
+}
+
+func (r *runPtraceAfterExecveCredsLock) execute(t *Task) taskRunState {
+	if t.killed() {
+		// execveCredsMutexUnlock() will not pass us the lock after we were killed, so there is no
+		// race in loading execveCredsMutexOwner without a lock.
+		if t.execveCredsMutexOwner != nil {
+			t.execveCredsMutexUnlock()
+		}
+		return (*runInterrupt)(nil)
+	}
+
+	defer t.execveCredsMutexUnlock()
+	err := t.ptraceAttach(r.target, r.seize, uintptr(r.data))
+	if err != nil {
+		return t.doSyscallError(err)
+	}
+	return (*runSyscallExit)(nil)
+}
+
+// Ptrace implements ptrace(2) excluding PTRACE_ATTACH and PTRACE_SEIZE.
 func (t *Task) Ptrace(req int64, pid ThreadID, addr, data hostarch.Addr) error {
 	// PTRACE_TRACEME ignores all other arguments.
 	if req == linux.PTRACE_TRACEME {
@@ -1013,16 +1063,6 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data hostarch.Addr) error {
 	target := t.tg.pidns.TaskWithID(pid)
 	if target == nil {
 		return linuxerr.ESRCH
-	}
-
-	// PTRACE_ATTACH and PTRACE_SEIZE do not require that target is not already
-	// a tracee.
-	if req == linux.PTRACE_ATTACH || req == linux.PTRACE_SEIZE {
-		seize := req == linux.PTRACE_SEIZE
-		if seize && addr != 0 {
-			return linuxerr.EIO
-		}
-		return t.ptraceAttach(target, seize, uintptr(data))
 	}
 	// PTRACE_KILL and PTRACE_INTERRUPT require that the target is a tracee,
 	// but does not require that it is ptrace-stopped.
@@ -1052,13 +1092,9 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data hostarch.Addr) error {
 	// may not yet have reached Task.doStop; wait for it to do so. This is safe
 	// because there's no way for target to initiate a ptrace-stop and then
 	// block (by calling Task.block) before entering it.
-	//
-	// Caveat: If tasks were just restored, the tracee's first call to
-	// Task.Activate (in Task.run) occurs before its first call to Task.doStop,
-	// which may block if the tracer's address space is active.
-	t.UninterruptibleSleepStart(true)
+	t.UninterruptibleSleepStart()
 	target.waitGoroutineStoppedOrExited()
-	t.UninterruptibleSleepFinish(true)
+	t.UninterruptibleSleepFinish()
 
 	// Resuming commands end the ptrace stop, but only if successful.
 	// PTRACE_LISTEN ends the ptrace stop if trapNotifyPending is already set on the
@@ -1166,9 +1202,6 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data hostarch.Addr) error {
 			Ctx:  t,
 			IO:   t.MemoryManager(),
 			Addr: ar.Start,
-			Opts: usermem.IOOpts{
-				AddressSpaceActive: true,
-			},
 		}, int(ar.Length()), target.Kernel().FeatureSet())
 		if err != nil {
 			return err
@@ -1193,9 +1226,6 @@ func (t *Task) Ptrace(req int64, pid ThreadID, addr, data hostarch.Addr) error {
 			Ctx:  t,
 			IO:   t.MemoryManager(),
 			Addr: ar.Start,
-			Opts: usermem.IOOpts{
-				AddressSpaceActive: true,
-			},
 		}, int(ar.Length()), target.Kernel().FeatureSet())
 		if err != nil {
 			return err

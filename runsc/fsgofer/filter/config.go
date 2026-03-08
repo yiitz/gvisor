@@ -129,6 +129,12 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 			seccomp.AnyValue{},
 			seccomp.EqualTo(unix.MAP_PRIVATE | unix.MAP_ANONYMOUS | unix.MAP_FIXED),
 		},
+		seccomp.PerArg{ // Used by vdso getrandom().
+			seccomp.AnyValue{},
+			seccomp.AnyValue{},
+			seccomp.EqualTo(unix.PROT_WRITE | unix.PROT_READ),
+			seccomp.EqualTo(linux.MAP_DROPPABLE | unix.MAP_ANONYMOUS),
+		},
 	},
 	unix.SYS_MPROTECT:  seccomp.MatchAll{},
 	unix.SYS_MUNMAP:    seccomp.MatchAll{},
@@ -162,7 +168,11 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_RT_SIGACTION:   seccomp.MatchAll{},
 	unix.SYS_RT_SIGPROCMASK: seccomp.MatchAll{},
 	unix.SYS_RT_SIGRETURN:   seccomp.MatchAll{},
-	unix.SYS_SCHED_YIELD:    seccomp.MatchAll{},
+	// Used by Go's automatic GOMAXPROCS updater.
+	unix.SYS_SCHED_GETAFFINITY: seccomp.PerArg{
+		seccomp.EqualTo(0),
+	},
+	unix.SYS_SCHED_YIELD: seccomp.MatchAll{},
 	unix.SYS_SENDMSG: seccomp.Or{
 		// Used by fdchannel.Endpoint.SendFD().
 		seccomp.PerArg{

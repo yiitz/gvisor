@@ -16,20 +16,23 @@ package control
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/eventchannel"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
-	pb "gvisor.dev/gvisor/pkg/sentry/control/control_go_proto"
+	pb "gvisor.dev/gvisor/pkg/sentry/control/control_api_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/user"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/urpc"
@@ -40,19 +43,25 @@ type Lifecycle struct {
 	// Kernel is the kernel where the tasks belong to.
 	Kernel *kernel.Kernel
 
+	// mu protects the fields below.
+	mu sync.RWMutex
+
 	// ShutdownCh is the channel used to signal the sentry to shutdown
 	// the sentry/sandbox.
 	ShutdownCh chan struct{}
 
-	// mu protects the fields below.
-	mu sync.RWMutex
-
-	// MountNamespacesMap is a map of container id/names and the mount
-	// namespaces.
-	MountNamespacesMap map[string]*vfs.MountNamespace
+	// ContainerNamespacesMap maps container IDs to namespaces.
+	ContainerNamespacesMap map[string]ContainerNamespaces
 
 	// containerMap is a map of the container id and the container.
 	containerMap map[string]*Container
+}
+
+// ContainerNamespaces holds container namespaces that are constructed before
+// StartContainer.
+type ContainerNamespaces struct {
+	MountNamespace *vfs.MountNamespace
+	PIDNamespace   *kernel.PIDNamespace
 }
 
 // containerState is the state of the container.
@@ -202,7 +211,7 @@ func (l *Lifecycle) StartContainer(args *StartContainerArgs, _ *uint32) error {
 	}
 
 	l.mu.RLock()
-	mntns, ok := l.MountNamespacesMap[args.ContainerID]
+	contNS, ok := l.ContainerNamespacesMap[args.ContainerID]
 	if !ok {
 		l.mu.RUnlock()
 		return fmt.Errorf("mount namespace is nil for %s", args.ContainerID)
@@ -215,7 +224,7 @@ func (l *Lifecycle) StartContainer(args *StartContainerArgs, _ *uint32) error {
 		if uid != 0 || gid != 0 {
 			return fmt.Errorf("container spec specified both an explicit UID/GID and a user name, only one or the other may be provided")
 		}
-		uid, gid = user.GetExecUIDGIDFromUser(l.Kernel.SupervisorContext(), mntns, args.User)
+		uid, gid = user.GetExecUIDGIDFromUser(l.Kernel.SupervisorContext(), contNS.MountNamespace, args.User)
 	}
 
 	creds := auth.NewUserCredentials(
@@ -237,10 +246,6 @@ func (l *Lifecycle) StartContainer(args *StartContainerArgs, _ *uint32) error {
 		ls.SetUnchecked(lt, limit)
 	}
 
-	// Create a new pid namespace for the container. Each container must run
-	// in its own pid namespace.
-	pidNs := l.Kernel.RootPIDNamespace().NewChild(l.Kernel.RootUserNamespace())
-
 	initArgs := kernel.CreateProcessArgs{
 		Filename: args.Filename,
 		Argv:     args.Argv,
@@ -253,8 +258,8 @@ func (l *Lifecycle) StartContainer(args *StartContainerArgs, _ *uint32) error {
 		MaxSymlinkTraversals: linux.MaxSymlinkTraversals,
 		UTSNamespace:         l.Kernel.RootUTSNamespace(),
 		IPCNamespace:         l.Kernel.RootIPCNamespace(),
+		PIDNamespace:         contNS.PIDNamespace,
 		ContainerID:          args.ContainerID,
-		PIDNamespace:         pidNs,
 	}
 
 	ctx := initArgs.NewContext(l.Kernel)
@@ -287,8 +292,10 @@ func (l *Lifecycle) StartContainer(args *StartContainerArgs, _ *uint32) error {
 	}
 	initArgs.FDTable = fdTable
 
-	initArgs.MountNamespace = mntns
+	initArgs.MountNamespace = contNS.MountNamespace
 	initArgs.MountNamespace.IncRef()
+	mntnsCu := cleanup.Make(func() { initArgs.MountNamespace.DecRef(ctx) })
+	defer mntnsCu.Clean()
 
 	if args.ResolveBinaryPath {
 		resolved, err := user.ResolveExecutablePath(ctx, &initArgs)
@@ -328,6 +335,7 @@ func (l *Lifecycle) StartContainer(args *StartContainerArgs, _ *uint32) error {
 	}
 	initArgs.InitialCgroups = initialCgroups
 
+	mntnsCu.Release() // mntns ref is transferred to Kernel.CreateProcess()
 	tg, _, err := l.Kernel.CreateProcess(initArgs)
 	if err != nil {
 		return err
@@ -353,6 +361,7 @@ func (l *Lifecycle) StartContainer(args *StartContainerArgs, _ *uint32) error {
 	l.mu.Unlock()
 
 	// Start the newly created process.
+	timeContainerProcessStarting := time.Now()
 	l.Kernel.StartProcess(tg)
 	log.Infof("Started the new container %v ", initArgs.ContainerID)
 
@@ -367,6 +376,10 @@ func (l *Lifecycle) StartContainer(args *StartContainerArgs, _ *uint32) error {
 		Started:         true,
 		ContainerId:     initArgs.ContainerID,
 		RequestReceived: timeRequestReceived,
+		ContainerProcessStarting: &timestamppb.Timestamp{
+			Seconds: timeContainerProcessStarting.Unix(),
+			Nanos:   int32(timeContainerProcessStarting.Nanosecond()),
+		},
 		RequestCompleted: &timestamppb.Timestamp{
 			Seconds: timeRequestCompleted.Unix(),
 			Nanos:   int32(timeRequestCompleted.Nanosecond()),
@@ -393,7 +406,12 @@ func (l *Lifecycle) reap(containerID string, tg *kernel.ThreadGroup) {
 
 // Shutdown sends signal to destroy the sentry/sandbox.
 func (l *Lifecycle) Shutdown(_, _ *struct{}) error {
-	close(l.ShutdownCh)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.ShutdownCh != nil {
+		close(l.ShutdownCh)
+		l.ShutdownCh = nil
+	}
 	return nil
 }
 
@@ -524,4 +542,24 @@ func (l *Lifecycle) SignalContainer(args *SignalContainerArgs, _ *struct{}) erro
 	l.Kernel.Pause()
 	defer l.Kernel.Unpause()
 	return l.Kernel.SendContainerSignal(args.ContainerID, &linux.SignalInfo{Signo: args.Signo})
+}
+
+// PauseExternalNetworking pauses external networking for the container.
+func (l *Lifecycle) PauseExternalNetworking(*ContainerArgs, *struct{}) error {
+	st, ok := l.Kernel.RootNetworkNamespace().Stack().(*netstack.Stack)
+	if !ok {
+		return errors.New("stack is not a netstack.Stack")
+	}
+	st.Stack.DisableAllNonLoopbackNICs()
+	return nil
+}
+
+// ResumeExternalNetworking resumes external networking for the container.
+func (l *Lifecycle) ResumeExternalNetworking(*ContainerArgs, *struct{}) error {
+	st, ok := l.Kernel.RootNetworkNamespace().Stack().(*netstack.Stack)
+	if !ok {
+		return errors.New("stack is not a netstack.Stack")
+	}
+	st.Stack.EnableAllNonLoopbackNICs()
+	return nil
 }

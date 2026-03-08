@@ -107,21 +107,9 @@ func (c CompressionLevel) String() string {
 	return string(c)
 }
 
-// Options is statefile options.
-type Options struct {
-	// Compression is an image compression type/level.
-	Compression CompressionLevel
-
-	// Resume indicates if the sandbox process should continue running
-	// after checkpointing.
-	Resume bool
-}
-
-// WriteToMetadata save options to the metadata storage.  Method returns the
-// reference to the original metadata map to allow to be used in the chain calls.
-func (o Options) WriteToMetadata(metadata map[string]string) map[string]string {
-	metadata[CompressionKey] = string(o.Compression)
-	return metadata
+// ToMetadata returns the compression level as a metadata map.
+func (c CompressionLevel) ToMetadata() map[string]string {
+	return map[string]string{CompressionKey: string(c)}
 }
 
 // CompressionLevelFromString parses a string into the CompressionLevel.
@@ -314,7 +302,7 @@ func metadata(r io.Reader, h hash.Hash) (map[string]string, error) {
 }
 
 // NewReader returns a reader for a statefile.
-func NewReader(r io.Reader, key []byte) (io.Reader, map[string]string, error) {
+func NewReader(r io.ReadCloser, key []byte) (io.ReadCloser, map[string]string, error) {
 	// Read the metadata with the hash.
 	h := hmac.New(sha256.New, key)
 	metadata, err := metadata(r, h)
@@ -331,13 +319,14 @@ func NewReader(r io.Reader, key []byte) (io.Reader, map[string]string, error) {
 	}
 
 	// Pick correct reader
-	var cr io.Reader
+	var cr io.ReadCloser
 
-	if compression == CompressionLevelFlateBestSpeed {
+	switch compression {
+	case CompressionLevelFlateBestSpeed:
 		cr, err = compressio.NewReader(r, key)
-	} else if compression == CompressionLevelNone {
+	case CompressionLevelNone:
 		cr = compressio.NewSimpleReader(r, key)
-	} else {
+	default:
 		// Should never occur, as it has the default path.
 		return nil, nil, fmt.Errorf("metadata contains invalid compression flag value: %v", compression)
 	}

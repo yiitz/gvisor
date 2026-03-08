@@ -152,6 +152,28 @@ func (c *Credentials) Fork() *Credentials {
 	return nc
 }
 
+// ForkIntoUserNamespace returns a copy of c after its caller has entered user
+// namespace ns.
+func (c *Credentials) ForkIntoUserNamespace(ns *UserNamespace) *Credentials {
+	nc := c.Fork()
+	nc.UserNamespace = ns
+	// "The child process created by clone(2) with the CLONE_NEWUSER flag
+	// starts out with a complete set of capabilities in the new user
+	// namespace. Likewise, a process that creates a new user namespace using
+	// unshare(2) or joins an existing user namespace using setns(2) gains a
+	// full set of capabilities in that namespace."
+	nc.PermittedCaps = AllCapabilities
+	nc.InheritableCaps = 0
+	nc.EffectiveCaps = AllCapabilities
+	nc.BoundingCaps = AllCapabilities
+	// "A call to clone(2), unshare(2), or setns(2) using the CLONE_NEWUSER
+	// flag sets the "securebits" flags (see capabilities(7)) to their default
+	// values (all flags disabled) in the child (for clone(2)) or caller (for
+	// unshare(2), or setns(2)." - user_namespaces(7)
+	nc.KeepCaps = false
+	return nc
+}
+
 // InGroup returns true if c is in group kgid. Compare Linux's
 // kernel/groups.c:in_group_p().
 func (c *Credentials) InGroup(kgid KGID) bool {
@@ -191,9 +213,21 @@ func (c *Credentials) HasCapabilityIn(cp linux.Capability, ns *UserNamespace) bo
 	}
 }
 
-// HasCapability returns true if c has capability cp in its user namespace.
-func (c *Credentials) HasCapability(cp linux.Capability) bool {
+// HasSelfCapability returns true if c has capability cp in its user namespace.
+func (c *Credentials) HasSelfCapability(cp linux.Capability) bool {
 	return c.HasCapabilityIn(cp, c.UserNamespace)
+}
+
+// HasRootCapability returns true if c has capability cp in c's user namespace's root.
+func (c *Credentials) HasRootCapability(cp linux.Capability) bool {
+	return c.HasCapabilityIn(cp, c.UserNamespace.Root())
+}
+
+// HasCapabilityOnFile returns true if creds has the given capability with
+// respect to a file with the given owning UID and GID, consistent with Linux's
+// kernel/capability.c:capable_wrt_inode_uidgid().
+func (c *Credentials) HasCapabilityOnFile(cp linux.Capability, kuid KUID, kgid KGID) bool {
+	return c.HasSelfCapability(cp) && c.UserNamespace.MapFromKUID(kuid).Ok() && c.UserNamespace.MapFromKGID(kgid).Ok()
 }
 
 // UseUID checks that c can use uid in its user namespace, then translates it
@@ -208,7 +242,7 @@ func (c *Credentials) UseUID(uid UID) (KUID, error) {
 		return NoID, linuxerr.EINVAL
 	}
 	// If c has CAP_SETUID, then it can use any UID in its user namespace.
-	if c.HasCapability(linux.CAP_SETUID) {
+	if c.HasSelfCapability(linux.CAP_SETUID) {
 		return kuid, nil
 	}
 	// Otherwise, c must already have the UID as its real, effective, or saved
@@ -226,41 +260,13 @@ func (c *Credentials) UseGID(gid GID) (KGID, error) {
 	if !kgid.Ok() {
 		return NoID, linuxerr.EINVAL
 	}
-	if c.HasCapability(linux.CAP_SETGID) {
+	if c.HasSelfCapability(linux.CAP_SETGID) {
 		return kgid, nil
 	}
 	if kgid == c.RealKGID || kgid == c.EffectiveKGID || kgid == c.SavedKGID {
 		return kgid, nil
 	}
 	return NoID, linuxerr.EPERM
-}
-
-// SetUID translates the provided uid to the root user namespace and updates c's
-// uids to it. This performs no permissions or capabilities checks, the caller
-// is responsible for ensuring the calling context is permitted to modify c.
-func (c *Credentials) SetUID(uid UID) error {
-	kuid := c.UserNamespace.MapToKUID(uid)
-	if !kuid.Ok() {
-		return linuxerr.EINVAL
-	}
-	c.RealKUID = kuid
-	c.EffectiveKUID = kuid
-	c.SavedKUID = kuid
-	return nil
-}
-
-// SetGID translates the provided gid to the root user namespace and updates c's
-// gids to it. This performs no permissions or capabilities checks, the caller
-// is responsible for ensuring the calling context is permitted to modify c.
-func (c *Credentials) SetGID(gid GID) error {
-	kgid := c.UserNamespace.MapToKGID(gid)
-	if !kgid.Ok() {
-		return linuxerr.EINVAL
-	}
-	c.RealKGID = kgid
-	c.EffectiveKGID = kgid
-	c.SavedKGID = kgid
-	return nil
 }
 
 // LoadSeccheckData sets credential data based on mask.

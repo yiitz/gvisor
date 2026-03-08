@@ -44,6 +44,9 @@ import (
 type FileDescription struct {
 	FileDescriptionRefs
 
+	// creds is the credentials under which the FileDescription was opened. It is immutable.
+	creds *auth.Credentials
+
 	// flagsMu protects `statusFlags` and `asyncHandler` below.
 	flagsMu sync.Mutex `state:"nosave"`
 
@@ -130,7 +133,7 @@ const FileCreationFlags = linux.O_CREAT | linux.O_EXCL | linux.O_NOCTTY | linux.
 // Init must be called before first use of fd. If it succeeds, it takes
 // references on mnt and d. flags is the initial file description flags, which
 // is usually the full set of flags passed to open(2).
-func (fd *FileDescription) Init(impl FileDescriptionImpl, flags uint32, mnt *Mount, d *Dentry, opts *FileDescriptionOptions) error {
+func (fd *FileDescription) Init(impl FileDescriptionImpl, flags uint32, creds *auth.Credentials, mnt *Mount, d *Dentry, opts *FileDescriptionOptions) error {
 	writable := MayWriteFileWithOpenFlags(flags)
 	if writable {
 		if err := mnt.CheckBeginWrite(); err != nil {
@@ -139,6 +142,7 @@ func (fd *FileDescription) Init(impl FileDescriptionImpl, flags uint32, mnt *Mou
 	}
 
 	fd.InitRefs()
+	fd.creds = creds
 
 	// Remove "file creation flags" to mirror the behavior from file.f_flags in
 	// fs/open.c:do_dentry_open.
@@ -193,18 +197,20 @@ func (fd *FileDescription) DecRef(ctx context.Context) {
 			fd.impl.UnlockPOSIX(ctx, fd, lock.LockRange{0, lock.LockEOF})
 		}
 
-		// Release implementation resources.
-		fd.impl.Release(ctx)
-		if fd.writable {
-			fd.vd.mount.EndWrite()
-		}
-		fd.vd.DecRef(ctx)
+		// Clean up O_ASYNC state.
 		fd.flagsMu.Lock()
 		if fd.statusFlags.RacyLoad()&linux.O_ASYNC != 0 && fd.asyncHandler != nil {
 			fd.impl.UnregisterFileAsyncHandler(fd)
 		}
 		fd.asyncHandler = nil
 		fd.flagsMu.Unlock()
+
+		// Release implementation resources.
+		fd.impl.Release(ctx)
+		if fd.writable {
+			fd.vd.mount.EndWrite()
+		}
+		fd.vd.DecRef(ctx)
 	})
 }
 
@@ -983,4 +989,56 @@ func CopyRegularFileData(ctx context.Context, dstFD, srcFD *FileDescription) (in
 			return done, nil
 		}
 	}
+}
+
+// GetFilePrivileges returns the file privileges for the file represented by fd.
+func (fd *FileDescription) GetFilePrivileges(ctx context.Context) (auth.FilePrivileges, error) {
+	stat, err := fd.Stat(ctx, StatOptions{
+		Mask: linux.STATX_UID | linux.STATX_GID | linux.STATX_MODE,
+	})
+	if err != nil {
+		return auth.FilePrivileges{}, err
+	}
+
+	filePrivs := auth.FilePrivileges{SetUserID: auth.NoID, SetGroupID: auth.NoID, HasCaps: false}
+	if fd.Mount().Options().Flags.NoSUID {
+		return filePrivs, nil
+	}
+
+	if stat.Mask&linux.STATX_MODE != 0 {
+		if stat.Mode&linux.ModeSetUID != 0 && stat.Mask&linux.STATX_UID != 0 {
+			filePrivs.SetUserID = auth.KUID(stat.UID)
+		}
+		if stat.Mode&linux.ModeSetGID != 0 && stat.Mask&linux.STATX_GID != 0 {
+			filePrivs.SetGroupID = auth.KGID(stat.GID)
+		}
+	}
+
+	fileCaps, err := fd.GetXattr(ctx, &GetXattrOptions{Name: linux.XATTR_SECURITY_CAPABILITY, Size: linux.XATTR_CAPS_SZ_3})
+	switch {
+	case linuxerr.Equals(linuxerr.ENODATA, err), linuxerr.Equals(linuxerr.EOPNOTSUPP, err):
+		return filePrivs, nil
+	case err != nil:
+		return auth.FilePrivileges{}, err
+	}
+	vfsCaps, err := auth.VfsCapDataOf([]byte(fileCaps))
+	if err != nil {
+		return auth.FilePrivileges{}, err
+	}
+
+	filePrivs.HasCaps = true
+	filePrivs.PermittedCaps = auth.CapabilitySet(vfsCaps.Permitted())
+	filePrivs.InheritableCaps = auth.CapabilitySet(vfsCaps.Inheritable())
+	filePrivs.Effective = (vfsCaps.MagicEtc & linux.VFS_CAP_FLAGS_EFFECTIVE) > 0
+
+	// gVisor does not support ID-mapped mounts and all filesystems are owned by
+	// the initial user namespace. So we can directly cast the root ID to KUID.
+	filePrivs.CapRootID = auth.KUID(vfsCaps.RootID)
+
+	return filePrivs, nil
+}
+
+// Credentials returns the credentials under which fd was opened.
+func (fd *FileDescription) Credentials() *auth.Credentials {
+	return fd.creds
 }

@@ -14,10 +14,31 @@
 
 package linux
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"structs"
+)
+
+// AIORing is struct aio_ring, from fs/aio.c, without the trailing
+// variable-length array.
+type AIORing struct {
+	_                structs.HostLayout
+	ID               uint32
+	Nr               uint32
+	Head             uint32
+	Tail             uint32
+	Magic            uint32
+	CompatFeatures   uint32
+	IncompatFeatures uint32
+	HeaderLength     uint32
+}
 
 // AIORingSize is sizeof(struct aio_ring).
 const AIORingSize = 32
+
+// AIO_RING_MAGIC is fs/aio.c:AIO_RING_MAGIC, the expected value of
+// AIORing.Magic.
+const AIO_RING_MAGIC = 0xa10a10a1
 
 // I/O commands.
 const (
@@ -45,6 +66,7 @@ const (
 //
 // +marshal
 type IOCallback struct {
+	_    structs.HostLayout
 	Data uint64
 	Key  uint32
 	_    uint32
@@ -69,6 +91,7 @@ type IOCallback struct {
 // +marshal
 // +stateify savable
 type IOEvent struct {
+	_       structs.HostLayout
 	Data    uint64
 	Obj     uint64
 	Result  int64

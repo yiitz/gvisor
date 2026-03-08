@@ -16,36 +16,30 @@
 package state
 
 import (
-	"bufio"
+	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
-	"gvisor.dev/gvisor/pkg/sentry/time"
-	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 )
 
 var previousMetadata map[string]string
 
-// ErrStateFile is returned when an error is encountered writing the statefile
-// (which may occur during open or close calls in addition to write).
-type ErrStateFile struct {
-	Err error
-}
-
-// Error implements error.Error().
-func (e ErrStateFile) Error() string {
-	return fmt.Sprintf("statefile error: %v", e.Err)
-}
+const (
+	// GvisorCPUUsageKey is the metadata key to store and retrieve CPU time usage
+	// across save restore.
+	GvisorCPUUsageKey = "gvisor_cpu_usage"
+	// GvisorWallTimeKey is the metadata key to store and retrieve wall time
+	// across save restore.
+	GvisorWallTimeKey = "gvisor_wall_time"
+)
 
 // SaveOpts contains save-related options.
 type SaveOpts struct {
@@ -54,11 +48,11 @@ type SaveOpts struct {
 
 	// PagesMetadata is the file into which MemoryFile metadata is stored if
 	// PagesMetadata is non-nil. Otherwise this content is stored in Destination.
-	PagesMetadata *fd.FD
+	PagesMetadata io.WriteCloser
 
 	// PagesFile is the file in which all MemoryFile pages are stored if
 	// PagesFile is non-nil. Otherwise this content is stored in Destination.
-	PagesFile *fd.FD
+	PagesFile stateio.AsyncWriter
 
 	// Key is used for state integrity check.
 	Key []byte
@@ -66,20 +60,53 @@ type SaveOpts struct {
 	// Metadata is save metadata.
 	Metadata map[string]string
 
-	// MemoryFileSaveOpts is passed to calls to pgalloc.MemoryFile.SaveTo().
-	MemoryFileSaveOpts pgalloc.SaveOpts
+	// AppMFExcludeCommittedZeroPages is the value of
+	// pgalloc.SaveOpts.ExcludeCommittedZeroPages for the application memory
+	// file.
+	AppMFExcludeCommittedZeroPages bool
 
 	// Resume indicates if the statefile is used for save-resume.
 	Resume bool
 
 	// Autosave indicates if the statefile is used for autosave.
 	Autosave bool
+
+	// StartTime stores the start time of the sandbox.
+	StartTime time.Time
+}
+
+// Close releases resources owned by opts.
+func (opts *SaveOpts) Close() error {
+	var dstErr, pmErr, pfErr error
+	if c, ok := opts.Destination.(io.Closer); ok {
+		dstErr = c.Close()
+	}
+	if opts.PagesMetadata != nil {
+		pmErr = opts.PagesMetadata.Close()
+	}
+	if opts.PagesFile != nil {
+		pfErr = opts.PagesFile.Close()
+	}
+	return errors.Join(dstErr, pmErr, pfErr)
 }
 
 // Save saves the system state.
-func (opts SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Watchdog) error {
-	t, _ := CPUTime()
+func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Watchdog) error {
+	t, err := CPUTime()
+	if err != nil {
+		log.Warningf("Error getting cpu time: %v", err)
+	}
 	log.Infof("Before save CPU usage: %s", t.String())
+
+	// Get the current time before save to calculate wall time.
+	var wt time.Duration
+	curTime := time.Now()
+	if opts.StartTime.IsZero() {
+		log.Warningf("Cannot calculate wall time as start time is not available")
+	} else {
+		wt = curTime.Sub(opts.StartTime)
+		log.Infof("Before save wall time: %s", wt.String())
+	}
 
 	log.Infof("Sandbox save started, pausing all tasks.")
 	k.Pause()
@@ -96,40 +123,36 @@ func (opts SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wat
 	if opts.Metadata == nil {
 		opts.Metadata = make(map[string]string)
 	}
+	if previousMetadata != nil {
+		// Update CPU time and wall time based on the previous runs.
+		p, err := time.ParseDuration(previousMetadata[GvisorCPUUsageKey])
+		if err != nil {
+			log.Warningf("Error parsing previous runs' cpu time: %v", err)
+		}
+		t += p
+
+		w, err := time.ParseDuration(previousMetadata[GvisorWallTimeKey])
+		if err != nil {
+			log.Warningf("Error parsing previous runs' wall time: %v", err)
+		}
+		wt += w
+	}
+	opts.Metadata[GvisorCPUUsageKey] = t.String()
+	if wt != 0 {
+		opts.Metadata[GvisorWallTimeKey] = wt.String()
+	}
 	addSaveMetadata(opts.Metadata)
 
 	// Open the statefile.
-	wc, err := statefile.NewWriter(opts.Destination, opts.Key, opts.Metadata)
+	wc, err := statefile.NewWriter(opts.Destination, opts.Key, opts.Metadata) // transfers ownership of opts.Destination to wc if err == nil
 	if err != nil {
-		err = ErrStateFile{err}
+		err = fmt.Errorf("statefile.NewWriter failed: %w", err)
 	} else {
-		var pagesMetadata io.Writer
-		if opts.PagesMetadata != nil {
-			// //pkg/state/wire writes one byte at a time; buffer these writes
-			// to avoid making one syscall per write. For the "main" state
-			// file, this buffering is handled by statefile.NewWriter() =>
-			// compressio.Writer or compressio.NewSimpleWriter().
-			pagesMetadata = bufio.NewWriter(opts.PagesMetadata)
-		}
-
+		opts.Destination = nil
 		// Save the kernel.
-		err = k.SaveTo(ctx, wc, pagesMetadata, opts.PagesFile, opts.MemoryFileSaveOpts)
-
-		// ENOSPC is a state file error. This error can only come from
-		// writing the state file, and not from fs.FileOperations.Fsync
-		// because we wrap those in kernel.TaskSet.flushWritesToFiles.
-		if linuxerr.Equals(linuxerr.ENOSPC, err) {
-			err = ErrStateFile{err}
-		}
-
-		if closeErr := wc.Close(); err == nil && closeErr != nil {
-			err = ErrStateFile{closeErr}
-		}
-		if pagesMetadata != nil {
-			if flushErr := pagesMetadata.(*bufio.Writer).Flush(); err == nil && flushErr != nil {
-				err = ErrStateFile{flushErr}
-			}
-		}
+		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile
+		opts.PagesMetadata = nil
+		opts.PagesFile = nil
 	}
 
 	t1, _ := CPUTime()
@@ -150,33 +173,13 @@ func (opts SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wat
 	return err
 }
 
-// LoadOpts contains load-related options.
-type LoadOpts struct {
-	// Source is the load source.
-	Source io.Reader
-
-	// PagesFileLoader is an optional PagesFileLoader.
-	// If unset, it will be created from `Source`.
-	PagesFileLoader kernel.PagesFileLoader
-
-	// If Background is true, the sentry may read from PagesFile after Load has
-	// returned.
-	Background bool
-
-	// Key is used for state integrity check.
-	Key []byte
-}
-
-// Load loads the given kernel, setting the provided platform and stack.
-func (opts LoadOpts) Load(ctx context.Context, k *kernel.Kernel, timeReady chan struct{}, n inet.Stack, clocks time.Clocks, vfsOpts *vfs.CompleteRestoreOptions, saveRestoreNet bool) error {
-	r, m, err := statefile.NewReader(opts.Source, opts.Key)
+// NewStatefileReader returns the statefile's metadata and a reader for it.
+// The ownership of source is transferred to the returned reader.
+func NewStatefileReader(source io.ReadCloser, key []byte) (io.ReadCloser, map[string]string, error) {
+	r, m, err := statefile.NewReader(source, key)
 	if err != nil {
-		return ErrStateFile{err}
-	}
-	pfl := opts.PagesFileLoader
-	if pfl == nil {
-		pfl = kernel.NewSingleStateFilePagesFileLoader(r)
+		return nil, nil, fmt.Errorf("statefile.NewReader failed: %w", err)
 	}
 	previousMetadata = m
-	return k.LoadFrom(ctx, r, pfl, opts.Background, timeReady, n, clocks, vfsOpts, saveRestoreNet)
+	return r, m, nil
 }

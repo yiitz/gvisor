@@ -56,11 +56,14 @@ func (x *SimpleExtendedAttributes) GetXattr(creds *auth.Credentials, mode linux.
 	if opts.Size != 0 && uint64(len(value)) > opts.Size {
 		return "", linuxerr.ERANGE
 	}
+	if opts.Name == linux.XATTR_SECURITY_CAPABILITY {
+		return auth.FixupVfsCapDataOnGet(creds, value)
+	}
 	return value, nil
 }
 
 // SetXattr sets 'value' at 'name'.
-func (x *SimpleExtendedAttributes) SetXattr(creds *auth.Credentials, mode linux.FileMode, kuid auth.KUID, opts *vfs.SetXattrOptions) error {
+func (x *SimpleExtendedAttributes) SetXattr(creds *auth.Credentials, mode linux.FileMode, kuid auth.KUID, kgid auth.KGID, opts *vfs.SetXattrOptions) error {
 	if err := vfs.CheckXattrPermissions(creds, vfs.MayWrite, mode, kuid, opts.Name); err != nil {
 		return err
 	}
@@ -82,6 +85,13 @@ func (x *SimpleExtendedAttributes) SetXattr(creds *auth.Credentials, mode linux.
 		return linuxerr.ENODATA
 	}
 
+	if opts.Name == linux.XATTR_SECURITY_CAPABILITY {
+		var err error
+		opts.Value, err = auth.FixupVfsCapDataOnSet(creds, opts.Value, kuid, kgid)
+		if err != nil {
+			return err
+		}
+	}
 	x.xattrs[opts.Name] = opts.Value
 	return nil
 }
@@ -92,7 +102,7 @@ func (x *SimpleExtendedAttributes) ListXattr(creds *auth.Credentials, size uint6
 	listSize := 0
 	x.mu.RLock()
 	names := make([]string, 0, len(x.xattrs))
-	haveCap := creds.HasCapability(linux.CAP_SYS_ADMIN)
+	haveCap := creds.HasRootCapability(linux.CAP_SYS_ADMIN)
 	for n := range x.xattrs {
 		// Hide extended attributes in the "trusted" namespace from
 		// non-privileged users. This is consistent with Linux's

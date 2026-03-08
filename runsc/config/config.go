@@ -24,11 +24,11 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
-	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/version"
 )
@@ -43,6 +43,11 @@ import (
 //  5. If adding an enum, follow the same pattern as FileAccessType
 //  6. Evaluate if the flag can be changed with OCI annotations. See
 //     overrideAllowlist for more details
+//
+// Follow these steps to deprecate a flag:
+//  1. Add a field to Config with the prefix "DEPRECATED", or remove the field
+//     if it is no longer needed at all.
+//  2. Add the flag to flags_graveyard.go and remove it from flags.go.
 type Config struct {
 	// RootDir is the runtime root directory.
 	RootDir string `flag:"root"`
@@ -120,7 +125,7 @@ type Config struct {
 	EnableRaw bool `flag:"net-raw"`
 
 	// AllowPacketEndpointWrite enables write operations on packet endpoints.
-	AllowPacketEndpointWrite bool `flag:"TESTONLY-allow-packet-endpoint-write"`
+	AllowPacketEndpointWrite bool `flag:"allow-packet-socket-write"`
 
 	// HostGSO indicates that host segmentation offload is enabled.
 	HostGSO bool `flag:"gso"`
@@ -160,7 +165,7 @@ type Config struct {
 	// This may either be 1) "addr:port" to export metrics on a specific network interface address,
 	// 2) ":port" for exporting metrics on all addresses, or 3) an absolute path to a Unix Domain
 	// Socket.
-	// The substring "%ID%" will be replaced by the container ID, and "%RUNTIME_ROOT%" by the root.
+	// The substring "%RUNTIME_ROOT%" will be replaced by the root directory.
 	// This flag must be specified *both* as part of the `runsc metric-server` arguments (so that the
 	// metric server knows which address to bind to), and as part of the `runsc create` arguments (as
 	// an indication that the container being created wishes that its metrics should be exported).
@@ -213,7 +218,7 @@ type Config struct {
 	EnableCoreTags bool `flag:"enable-core-tags"`
 
 	// WatchdogAction sets what action the watchdog takes when triggered.
-	WatchdogAction watchdog.Action `flag:"watchdog-action"`
+	WatchdogAction string `flag:"watchdog-action"`
 
 	// PanicSignal registers signal handling that panics. Usually set to
 	// SIGUSR2(12) to troubleshoot hangs. -1 disables it.
@@ -229,6 +234,15 @@ type Config struct {
 	// ProfileCPU collects a CPU profile to the passed file for the
 	// duration of the container execution. Requires ProfileEnabled.
 	ProfileCPU string `flag:"profile-cpu"`
+
+	// ProfileGCInterval forces a garbage-collection cycle at regular intervals.
+	// Useful for benchmark runs where the GC threshold may not be reached
+	// but for which it is useful to have GC (and the effects of GC) show
+	// up in the traces, while keeping the profile short.
+	// Requires `ProfileEnable`, and triggered when any other type of
+	// time-based profiling is enabled.
+	// If zero, GC happens per the Go runtime's default behavior.
+	ProfileGCInterval time.Duration `flag:"profile-gc-interval"`
 
 	// ProfileHeap collects a heap profile to the passed file for the
 	// duration of the container execution. Requires ProfileEnabled.
@@ -287,9 +301,6 @@ type Config struct {
 	// PodInitConfig is the path to configuration file with additional steps to
 	// take during pod creation.
 	PodInitConfig string `flag:"pod-init-config"`
-
-	// Use pools to manage buffer memory instead of heap.
-	BufferPooling bool `flag:"buffer-pooling"`
 
 	// XDP controls Whether and how to use XDP.
 	XDP XDP `flag:"EXPERIMENTAL-xdp"`
@@ -382,12 +393,38 @@ type Config struct {
 	// TestOnlyAutosaveResume indicates save resume for syscall tests.
 	TestOnlyAutosaveResume bool `flag:"TESTONLY-autosave-resume"`
 
-	// TestOnlySaveRestoreNetstack indicates netstack should be saved and restored.
-	TestOnlySaveRestoreNetstack bool `flag:"TESTONLY-save-restore-netstack"`
-
 	// RestoreSpecValidation indicates the level of spec validation to be
 	// performed during restore.
 	RestoreSpecValidation RestoreSpecValidationPolicy `flag:"restore-spec-validation"`
+
+	// GVisorMarkerFile enables the /proc/gvisor/kernel_is_gvisor marker file.
+	GVisorMarkerFile bool `flag:"gvisor-marker-file"`
+
+	// SystrapDisableSyscallPatching disables syscall patching in Systrap.
+	SystrapDisableSyscallPatching bool `flag:"systrap-disable-syscall-patching"`
+
+	// SaveRestoreNetstack indicates whether netstack should be saved and restored.
+	SaveRestoreNetstack bool `flag:"save-restore-netstack"`
+
+	// Nftables enables support for nftables to be used instead of iptables.
+	Nftables bool `flag:"TESTONLY-nftables"`
+
+	// AllowSUID causes ID elevation to be allowed when execving into executables
+	// with the SUID/SGID bits set.
+	AllowSUID bool `flag:"allow-suid"`
+
+	// UseCPUNums causes the sentry to use KVM CPU numbers as CPU numbers in the
+	// sentry. This is necessary to support features like rseq.
+	UseCPUNums bool `flag:"kvm-use-cpu-nums"`
+
+	// PauseExternalNetworking indicates whether external networking should be
+	// disabled on sandbox start. This is only supported with sandbox networking
+	// and can be unpaused manually.
+	PauseExternalNetworking bool `flag:"pause-external-networking"`
+
+	// AllowRootfsTarAnnotation indicates whether the rootfs tar annotation
+	// should be allowed.
+	AllowRootfsTarAnnotation bool `flag:"allow-rootfs-tar-annotation"`
 }
 
 func (c *Config) validate() error {
@@ -400,6 +437,9 @@ func (c *Config) validate() error {
 	}
 	if c.NumNetworkChannels <= 0 {
 		return fmt.Errorf("num_network_channels must be > 0, got: %d", c.NumNetworkChannels)
+	}
+	if c.PauseExternalNetworking && c.Network != NetworkSandbox {
+		return fmt.Errorf("pause-external-networking flag is only supported with sandbox networking")
 	}
 	// Require profile flags to explicitly opt-in to profiling with
 	// -profile rather than implying it since these options have security
@@ -439,8 +479,12 @@ func (c *Config) Log() {
 	log.Infof("RootDir: %s", c.RootDir)
 	log.Infof("FileAccess: %v / Directfs: %t / Overlay: %v", c.FileAccess, c.DirectFS, c.GetOverlay2())
 	log.Infof("Network: %v", c.Network)
+	log.Infof("UseCPUNums: %t", c.UseCPUNums)
 	if c.Debug || c.Strace {
 		log.Infof("Debug: %t. Strace: %t, max size: %d, syscalls: %s", c.Debug, c.Strace, c.StraceLogSize, c.StraceSyscalls)
+	}
+	if !c.AllowSUID {
+		log.Warningf("--allow-suid is disabled, SUID/SGID bits on executables will be ignored.")
 	}
 	if c.Debug {
 		obj := reflect.ValueOf(c).Elem()
@@ -471,7 +515,7 @@ func (c *Config) Log() {
 func (c *Config) GetHostUDS() HostUDS {
 	if c.FSGoferHostUDS {
 		if c.HostUDS != HostUDSNone {
-			panic(fmt.Sprintf("HostUDS cannot be set when --fsgofer-host-uds=true"))
+			panic("HostUDS cannot be set when --fsgofer-host-uds=true")
 		}
 		// Using deprecated flag, honor it to avoid breaking users.
 		return HostUDSOpen
@@ -484,7 +528,7 @@ func (c *Config) GetHostUDS() HostUDS {
 func (c *Config) GetOverlay2() Overlay2 {
 	if c.Overlay {
 		if c.Overlay2.Enabled() {
-			panic(fmt.Sprintf("Overlay2 cannot be set when --overlay=true"))
+			panic("Overlay2 cannot be set when --overlay=true")
 		}
 		// Using a deprecated flag, honor it to avoid breaking users.
 		return Overlay2{rootMount: true, subMounts: true, medium: "memory"}
@@ -714,10 +758,6 @@ func leakModePtr(v refs.LeakMode) *refs.LeakMode {
 	return &v
 }
 
-func watchdogActionPtr(v watchdog.Action) *watchdog.Action {
-	return &v
-}
-
 // HostUDS tells how much of the host UDS the file system has access to.
 type HostUDS int
 
@@ -900,6 +940,11 @@ type Overlay2 struct {
 	rootMount bool
 	subMounts bool
 	medium    OverlayMedium
+	// Size of overlay upper layer.
+	// Passed as is to tmpfs mount, as `size={size}`.
+	// Empty means use default.
+	// Size is applied to each overlay independently and not shared by overlays.
+	size string
 }
 
 func defaultOverlay2() *Overlay2 {
@@ -907,17 +952,30 @@ func defaultOverlay2() *Overlay2 {
 	return &Overlay2{rootMount: true, subMounts: false, medium: SelfOverlay}
 }
 
+func setOverlay2Err(v string) error {
+	return fmt.Errorf("expected format is --overlay2={mount}:{medium}[,size={size}], got %q", v)
+}
+
+// `--overlay2=...` param `size=`.
+const overlay2SizeEq = "size="
+
 // Set implements flag.Value. Set(String()) should be idempotent.
 func (o *Overlay2) Set(v string) error {
 	if v == "none" {
 		o.rootMount = false
 		o.subMounts = false
 		o.medium = NoOverlay
+		o.size = ""
 		return nil
 	}
-	vs := strings.Split(v, ":")
+	parts := strings.Split(v, ",")
+	if len(parts) < 1 {
+		return setOverlay2Err(v)
+	}
+
+	vs := strings.Split(parts[0], ":")
 	if len(vs) != 2 {
-		return fmt.Errorf("expected format is --overlay2={mount}:{medium}, got %q", v)
+		return setOverlay2Err(v)
 	}
 
 	switch mount := vs[0]; mount {
@@ -930,7 +988,25 @@ func (o *Overlay2) Set(v string) error {
 		return fmt.Errorf("unexpected mount specifier for --overlay2: %q", mount)
 	}
 
-	return o.medium.Set(vs[1])
+	err := o.medium.Set(vs[1])
+	if err != nil {
+		return err
+	}
+
+	if len(parts) == 1 {
+		o.size = ""
+	} else if len(parts) == 2 {
+		sizeArg := parts[1]
+		size, cut := strings.CutPrefix(sizeArg, overlay2SizeEq)
+		if !cut {
+			return setOverlay2Err(v)
+		}
+		o.size = size
+	} else {
+		return setOverlay2Err(v)
+	}
+
+	return nil
 }
 
 // Get implements flag.Value.
@@ -952,7 +1028,13 @@ func (o Overlay2) String() string {
 	default:
 		panic("invalid state of subMounts = true and rootMount = false")
 	}
-	return res + ":" + o.medium.String()
+
+	var sizeSuffix string
+	if o.size != "" {
+		sizeSuffix = fmt.Sprintf(",%s%s", overlay2SizeEq, o.size)
+	}
+
+	return res + ":" + o.medium.String() + sizeSuffix
 }
 
 // Enabled returns true if the overlay option is enabled for any mounts.
@@ -968,12 +1050,26 @@ func (o *Overlay2) RootOverlayMedium() OverlayMedium {
 	return o.medium
 }
 
+func (o *Overlay2) RootOverlaySize() string {
+	if !o.rootMount {
+		return ""
+	}
+	return o.size
+}
+
 // SubMountOverlayMedium returns the overlay medium config of submounts.
 func (o *Overlay2) SubMountOverlayMedium() OverlayMedium {
 	if !o.subMounts {
 		return NoOverlay
 	}
 	return o.medium
+}
+
+func (o *Overlay2) SubMountOverlaySize() string {
+	if !o.subMounts {
+		return ""
+	}
+	return o.size
 }
 
 // Medium returns the overlay medium config.

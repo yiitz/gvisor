@@ -18,11 +18,11 @@ import (
 	"fmt"
 
 	"golang.org/x/sync/errgroup"
-	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sync"
 
 	// Import platforms that we need to precompile filters for.
 	_ "gvisor.dev/gvisor/pkg/sentry/platform/platforms"
@@ -136,6 +136,7 @@ func PrecompiledPrograms() ([]precompiledseccomp.Program, error) {
 		return nil, err
 	}
 	programs := make([]precompiledseccomp.Program, len(opts))
+	var programsMu sync.Mutex
 	var errGroup errgroup.Group
 	for i, opt := range opts {
 		i, opt := i, opt
@@ -144,27 +145,28 @@ func PrecompiledPrograms() ([]precompiledseccomp.Program, error) {
 			for varName := range opt.Vars() {
 				varNames = append(varNames, varName)
 			}
-			program, err := precompiledseccomp.Precompile(opt.ConfigKey(), varNames, func(vars precompiledseccomp.Values) precompiledseccomp.ProgramDesc {
+			program, err := precompiledseccomp.Precompile(opt.ConfigKey(), varNames, func(vars precompiledseccomp.Values) *seccomp.Program {
 				opt := opt
 				seccompOpts := SeccompOptions(opt)
 				rules, denyRules := rules(opt, vars)
-				return precompiledseccomp.ProgramDesc{
-					Rules: []seccomp.RuleSet{
+				return &seccomp.Program{
+					RuleSets: []seccomp.RuleSet{
 						{
-							Rules:  denyRules.Copy(),
-							Action: seccompOpts.DefaultAction,
+							Rules: denyRules.Copy(),
 						},
 						{
 							Rules:  rules.Copy(),
-							Action: linux.SECCOMP_RET_ALLOW,
+							Action: seccomp.Allow,
 						},
 					},
-					SeccompOptions: seccompOpts,
+					Options: seccompOpts,
 				}
 			})
 			if err != nil {
 				return fmt.Errorf("cannot precompile seccomp program for options %v: %w", opt.ConfigKey(), err)
 			}
+			programsMu.Lock()
+			defer programsMu.Unlock()
 			programs[i] = program
 			return nil
 		})

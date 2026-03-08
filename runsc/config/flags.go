@@ -15,42 +15,43 @@
 package config
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strconv"
 	"strings"
-	"text/template"
 
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/runsc/flag"
 )
 
 // Reused flag names.
 const (
-	flagDebug             = "debug"
-	flagDebugToUserLog    = "debug-to-user-log"
-	flagStrace            = "strace"
-	flagStraceSyscalls    = "strace-syscalls"
-	flagStraceLogSize     = "strace-log-size"
-	flagHostUDS           = "host-uds"
-	flagNetDisconnectOK   = "net-disconnect-ok"
-	flagReproduceNFTables = "reproduce-nftables"
-	flagOCISeccomp        = "oci-seccomp"
-	flagOverlay2          = "overlay2"
-	flagAllowFlagOverride = "allow-flag-override"
+	flagDebug                   = "debug"
+	flagDebugCommand            = "debug-command"
+	flagDebugToUserLog          = "debug-to-user-log"
+	flagStrace                  = "strace"
+	flagStraceSyscalls          = "strace-syscalls"
+	flagStraceLogSize           = "strace-log-size"
+	flagHostUDS                 = "host-uds"
+	flagNetDisconnectOK         = "net-disconnect-ok"
+	flagReproduceNFTables       = "reproduce-nftables"
+	flagOCISeccomp              = "oci-seccomp"
+	flagOverlay2                = "overlay2"
+	flagAllowFlagOverride       = "allow-flag-override"
+	flagPauseExternalNetworking = "pause-external-networking"
+
+	defaultRootDir      = "/var/run/runsc"
+	xdgRuntimeDirEnvVar = "XDG_RUNTIME_DIR"
 )
 
 // RegisterFlags registers flags used to populate Config.
 func RegisterFlags(flagSet *flag.FlagSet) {
 	// Although these flags are not part of the OCI spec, they are used by
 	// Docker, and thus should not be changed.
-	flagSet.String("root", "", "root directory for storage of container state.")
+	flagSet.String("root", "", fmt.Sprintf("root directory for storage of container state, defaults are $%s/runsc, %s.", xdgRuntimeDirEnvVar, defaultRootDir))
 	flagSet.String("log", "", "file path where internal debug information is written, default is stdout.")
 	flagSet.String("log-format", "text", "log format: text (default), json, or json-k8s.")
 	flagSet.Bool(flagDebug, false, "enable debug logging.")
@@ -61,7 +62,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 
 	// Debugging flags.
 	flagSet.String("debug-log", "", "additional location for logs. If it ends with '/', log files are created inside the directory with default names. The following variables are available: %TIMESTAMP%, %COMMAND%.")
-	flagSet.String("debug-command", "", `comma-separated list of commands to be debugged if --debug-log is also set. Empty means debug all. "!" negates the expression. E.g. "create,start" or "!boot,events"`)
+	flagSet.String(flagDebugCommand, "", `comma-separated list of commands to be debugged if --debug-log is also set. Empty means debug all. "!" negates the expression. E.g. "create,start" or "!boot,events"`)
 	flagSet.String("panic-log", "", "file path where panic reports and other Go's runtime messages are written.")
 	flagSet.String("coverage-report", "", "file path where Go coverage reports are written. Reports will only be generated if runsc is built with --collect_code_coverage and --instrumentation_filter Bazel flags.")
 	flagSet.Bool("log-packets", false, "enable network packet logging.")
@@ -76,7 +77,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.String("traceback", "system", "golang runtime's traceback level")
 
 	// Metrics flags.
-	flagSet.String("metric-server", "", "if set, export metrics on this address. This may either be 1) 'addr:port' to export metrics on a specific network interface address, 2) ':port' for exporting metrics on all interfaces, or 3) an absolute path to a Unix Domain Socket. The substring '%ID%' will be replaced by the container ID, and '%RUNTIME_ROOT%' by the root. This flag must be specified in both `runsc metric-server` and `runsc create`, and their values must match.")
+	flagSet.String("metric-server", "", "if set, export metrics on this address. This may either be 1) 'addr:port' to export metrics on a specific network interface address, 2) ':port' for exporting metrics on all interfaces, or 3) an absolute path to a Unix Domain Socket. The substring '%RUNTIME_ROOT%' will be replaced by the root directory. This flag must be specified in both `runsc metric-server` and `runsc create`, and their values must match.")
 	flagSet.String("final-metrics-log", "", "if set, write all metric data to this file upon sandbox termination")
 	flagSet.String("profiling-metrics", "", "comma separated list of metric names which are going to be written to the profiling-metrics-log file from within the sentry in CSV format. profiling-metrics will be snapshotted at a rate specified by profiling-metrics-rate-us. Requires profiling-metrics-log to be set. (DO NOT USE IN PRODUCTION).")
 	flagSet.String("profiling-metrics-log", "", "file name to use for profiling-metrics output; use the special value '-' to write to the user-visible logs. (DO NOT USE IN PRODUCTION)")
@@ -91,22 +92,27 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	// Flags that control sandbox runtime behavior.
 	flagSet.String("platform", "systrap", "specifies which platform to use: systrap (default), ptrace, kvm.")
 	flagSet.String("platform_device_path", "", "path to a platform-specific device file (e.g. /dev/kvm for KVM platform). If unset, will use a sane platform-specific default.")
-	flagSet.Var(watchdogActionPtr(watchdog.LogWarning), "watchdog-action", "sets what action the watchdog takes when triggered: log (default), panic.")
+	flagSet.String("watchdog-action", "log", "sets what action the watchdog takes when triggered: log (default), panic.")
 	flagSet.Int("panic-signal", -1, "register signal handling that panics. Usually set to SIGUSR2(12) to troubleshoot hangs. -1 disables it.")
 	flagSet.Bool("profile", false, "prepares the sandbox to use Golang profiler. Note that enabling profiler loosens the seccomp protection added to the sandbox (DO NOT USE IN PRODUCTION).")
 	flagSet.String("profile-block", "", "collects a block profile to this file path for the duration of the container execution. Requires -profile=true.")
 	flagSet.String("profile-cpu", "", "collects a CPU profile to this file path for the duration of the container execution. Requires -profile=true.")
+	flagSet.Duration("profile-gc-interval", 0, "forces a garbage collection cycle every this duration while another type of time-based profiling is enabled. Requires -profile=true.")
 	flagSet.String("profile-heap", "", "collects a heap profile to this file path for the duration of the container execution. Requires -profile=true.")
 	flagSet.String("profile-mutex", "", "collects a mutex profile to this file path for the duration of the container execution. Requires -profile=true.")
 	flagSet.String("trace", "", "collects a Go runtime execution trace to this file path for the duration of the container execution.")
 	flagSet.Bool("rootless", false, "it allows the sandbox to be started with a user that is not root. Sandbox and Gofer processes may run with same privileges as current user.")
 	flagSet.Var(leakModePtr(refs.NoLeakChecking), "ref-leak-mode", "sets reference leak check mode: disabled (default), log-names, log-traces.")
-	flagSet.Bool("cpu-num-from-quota", false, "set cpu number to cpu quota (least integer greater or equal to quota value, but not less than 2)")
+	flagSet.Bool("cpu-num-from-quota", true, "set cpu number to cpu quota (least integer greater or equal to quota value, but not less than 2)")
 	flagSet.Bool(flagOCISeccomp, false, "Enables loading OCI seccomp filters inside the sandbox.")
 	flagSet.Bool("enable-core-tags", false, "enables core tagging. Requires host linux kernel >= 5.14.")
 	flagSet.String("pod-init-config", "", "path to configuration file with additional steps to take during pod creation.")
 	flagSet.Var(HostSettingsCheck.Ptr(), "host-settings", "how to handle non-optimal host kernel settings: check (default, advisory-only), ignore (do not check), adjust (best-effort auto-adjustment), or enforce (auto-adjustment must succeed).")
 	flagSet.Var(RestoreSpecValidationEnforce.Ptr(), "restore-spec-validation", "how to handle spec validation during restore.")
+	flagSet.Bool("systrap-disable-syscall-patching", false, "disables syscall patching when using the Systrap platform. May be necessary to use in case the workload uses the GS register, or uses ptrace within gVisor. Has significant performance implications and is only recommended when the sandbox is known to run otherwise-incompatible workloads. Only relevant for x86.")
+	flagSet.Bool("allow-suid", false, "allows ID elevation when executing binaries with the SUID/SGID bits set. The OCI --no-new-privileges flag continues to prevent ID elevation even when this flag is true.")
+	flagSet.Bool("kvm-use-cpu-nums", false, "on KVM use vCPU numbers as CPU numbers in the sentry. This is necessary to support features like rseq.")
+	flagSet.Bool("allow-rootfs-tar-annotation", false, "allows the rootfs tar annotation to be set.")
 
 	// Flags that control sandbox runtime behavior: MM related.
 	flagSet.Bool("app-huge-pages", true, "enable use of huge pages for application memory; requires /sys/kernel/mm/transparent_hugepage/shmem_enabled = advise")
@@ -115,24 +121,27 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Var(fileAccessTypePtr(FileAccessExclusive), "file-access", "specifies which filesystem validation to use for the root mount: exclusive (default), shared.")
 	flagSet.Var(fileAccessTypePtr(FileAccessShared), "file-access-mounts", "specifies which filesystem validation to use for volumes other than the root mount: shared (default), exclusive.")
 	flagSet.Bool("overlay", false, "DEPRECATED: use --overlay2=all:memory to achieve the same effect")
-	flagSet.Var(defaultOverlay2(), flagOverlay2, "wrap mounts with overlayfs. Format is {mount}:{medium}, where 'mount' can be 'root' or 'all' and medium can be 'memory', 'self' or 'dir=/abs/dir/path' in which filestore will be created. 'none' will turn overlay mode off.")
-	flagSet.Bool("fsgofer-host-uds", false, "DEPRECATED: use host-uds=all")
+	flagSet.Var(defaultOverlay2(), flagOverlay2, "wrap mounts with overlayfs. Format is\n"+
+		"* 'none' to turn overlay mode off\n"+
+		"* {mount}:{medium}[,size={size}], where\n"+
+		"    'mount' can be 'root' or 'all'\n"+
+		"    'medium' can be 'memory', 'self' or 'dir=/abs/dir/path' in which filestore will be created\n"+
+		"    'size' optional parameter overrides default overlay upper layer size\n")
 	flagSet.Var(hostUDSPtr(HostUDSNone), flagHostUDS, "controls permission to access host Unix-domain sockets. Values: none|open|create|all, default: none")
 	flagSet.Var(hostFifoPtr(HostFifoNone), "host-fifo", "controls permission to access host FIFOs (or named pipes). Values: none|open, default: none")
+	flagSet.Bool("gvisor-marker-file", false, "enable the presence of the /proc/gvisor/kernel_is_gvisor file that can be used by applications to detect that gVisor is in use")
 
-	flagSet.Bool("vfs2", true, "DEPRECATED: this flag has no effect.")
-	flagSet.Bool("fuse", true, "DEPRECATED: this flag has no effect.")
-	flagSet.Bool("lisafs", true, "DEPRECATED: this flag has no effect.")
-	flagSet.Bool("cgroupfs", false, "DEPRECATED: this flag has no effect.")
 	flagSet.Bool("ignore-cgroups", false, "don't configure cgroups.")
 	flagSet.Int("fdlimit", -1, "Specifies a limit on the number of host file descriptors that can be open. Applies separately to the sentry and gofer. Note: each file in the sandbox holds more than one host FD open.")
 	flagSet.Int("dcache", -1, "Set the global dentry cache size. This acts as a coarse-grained control on the number of host FDs simultaneously open by the sentry. If negative, per-mount caches are used.")
 	flagSet.Bool("iouring", false, "TEST ONLY; Enables io_uring syscalls in the sentry. Support is experimental and very limited.")
 	flagSet.Bool("directfs", true, "directly access the container filesystems from the sentry. Sentry runs with higher privileges.")
+	flagSet.Bool("TESTONLY-nftables", false, "TEST ONLY; Enables nftables support in the sentry.")
 
 	// Flags that control sandbox runtime behavior: network related.
 	flagSet.Var(networkTypePtr(NetworkSandbox), "network", "specifies which network to use: sandbox (default), host, none. Using network inside the sandbox is more secure because it's isolated from the host network.")
 	flagSet.Bool("net-raw", false, "enable raw sockets. When false, raw sockets are disabled by removing CAP_NET_RAW from containers (`runsc exec` will still be able to utilize raw sockets). Raw sockets allow malicious containers to craft packets and potentially attack the network.")
+	flagSet.Bool("allow-packet-socket-write", false, "allow writes on AF_PACKET sockets. When false, writes on AF_PACKET sockets will fail. When turned on, untrusted workloads may potentially attack the network because of the ability to craft arbitrary packets.")
 	flagSet.Bool("gso", true, "enable host segmentation offload if it is supported by a network device.")
 	flagSet.Bool("software-gso", true, "enable gVisor segmentation offload when host offload can't be enabled.")
 	flagSet.Bool("gvisor-gro", false, "enable gVisor generic receive offload")
@@ -141,16 +150,17 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Var(queueingDisciplinePtr(QDiscFIFO), "qdisc", "specifies which queueing discipline to apply by default to the non loopback nics used by the sandbox.")
 	flagSet.Int("num-network-channels", 1, "number of underlying channels(FDs) to use for network link endpoints.")
 	flagSet.Int("network-processors-per-channel", 0, "number of goroutines in each channel for processng inbound packets. If 0, the link endpoint will divide GOMAXPROCS evenly among the number of channels specified by num-network-channels.")
-	flagSet.Bool("buffer-pooling", true, "DEPRECATED: this flag has no effect. Buffer pooling is always enabled.")
 	flagSet.Var(&xdpConfig, "EXPERIMENTAL-xdp", `whether and how to use XDP. Can be one of: "off" (default), "ns", "redirect:<device name>", or "tunnel:<device name>"`)
 	flagSet.Bool("EXPERIMENTAL-xdp-need-wakeup", true, "EXPERIMENTAL. Use XDP_USE_NEED_WAKEUP with XDP sockets.") // TODO(b/240191988): Figure out whether this helps and remove it as a flag.
 	flagSet.Bool("reproduce-nat", false, "Scrape the host netns NAT table and reproduce it in the sandbox.")
 	flagSet.Bool(flagReproduceNFTables, false, "Attempt to scrape and reproduce nftable rules inside the sandbox. Overrides reproduce-nat when true.")
 	flagSet.Bool(flagNetDisconnectOK, true, "Indicates whether open network connections and open unix domain sockets should be disconnected upon save.")
+	flagSet.Bool("save-restore-netstack", true, "Indicates whether netstack save/restore is enabled.")
+	flagSet.Bool(flagPauseExternalNetworking, false, "Start the sandbox with external networking disabled. Only supported when using the sandbox network type. The network can be unpaused manually after the sandbox is running.")
 
 	// Flags that control sandbox runtime behavior: accelerator related.
 	flagSet.Bool("nvproxy", false, "EXPERIMENTAL: enable support for Nvidia GPUs")
-	flagSet.Bool("nvproxy-docker", false, "DEPRECATED: use nvidia-container-runtime or `docker run --gpus` directly. Or manually add nvidia-container-runtime-hook as a prestart hook and set up NVIDIA_VISIBLE_DEVICES container environment variable.")
+	flagSet.Bool("nvproxy-docker", false, "LEGACY: Injects nvidia-container-runtime-hook as a prestart hook. Try to use nvidia-container-runtime or `docker run --gpus` instead. Or manually add nvidia-container-runtime-hook as a prestart hook and set up NVIDIA_VISIBLE_DEVICES container environment variable.")
 	flagSet.String("nvproxy-driver-version", "", "NVIDIA driver ABI version to use. If empty, autodetect installed driver version. The special value 'latest' may also be used to use the latest ABI.")
 	flagSet.String("nvproxy-allowed-driver-capabilities", "utility,compute", "Comma separated list of NVIDIA driver capabilities that are allowed to be requested by the container. If 'all' is specified here, it is resolved to all driver capabilities supported in nvproxy. If 'all' is requested by the container, it is resolved to this list.")
 	flagSet.Bool("tpuproxy", false, "EXPERIMENTAL: enable support for TPU device passthrough.")
@@ -158,11 +168,11 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	// Test flags, not to be used outside tests, ever.
 	flagSet.Bool("TESTONLY-unsafe-nonroot", false, "TEST ONLY; do not ever use! This skips many security measures that isolate the host from the sandbox.")
 	flagSet.String("TESTONLY-test-name-env", "", "TEST ONLY; do not ever use! Used for automated tests to improve logging.")
-	flagSet.Bool("TESTONLY-allow-packet-endpoint-write", false, "TEST ONLY; do not ever use! Used for tests to allow writes on packet sockets.")
 	flagSet.Bool("TESTONLY-afs-syscall-panic", false, "TEST ONLY; do not ever use! Used for tests exercising gVisor panic reporting.")
 	flagSet.String("TESTONLY-autosave-image-path", "", "TEST ONLY; enable auto save for syscall tests and set path for state file.")
 	flagSet.Bool("TESTONLY-autosave-resume", false, "TEST ONLY; enable auto save and resume for syscall tests and set path for state file.")
-	flagSet.Bool("TESTONLY-save-restore-netstack", false, "TEST ONLY; enable save/restore for netstack.")
+
+	RegisterDeprecatedFlags(flagSet)
 }
 
 // overrideAllowlist lists all flags that can be changed using OCI
@@ -172,16 +182,18 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 var overrideAllowlist = map[string]struct {
 	check func(name string, value string) error
 }{
-	flagDebug:             {},
-	flagDebugToUserLog:    {},
-	flagStrace:            {},
-	flagStraceSyscalls:    {},
-	flagStraceLogSize:     {},
-	flagHostUDS:           {},
-	flagNetDisconnectOK:   {},
-	flagReproduceNFTables: {},
-	flagOverlay2:          {check: checkOverlay2},
-	flagOCISeccomp:        {check: checkOciSeccomp},
+	flagDebug:                   {},
+	flagDebugCommand:            {},
+	flagDebugToUserLog:          {},
+	flagStrace:                  {},
+	flagStraceSyscalls:          {},
+	flagStraceLogSize:           {},
+	flagHostUDS:                 {},
+	flagNetDisconnectOK:         {},
+	flagReproduceNFTables:       {},
+	flagOverlay2:                {check: checkOverlay2},
+	flagOCISeccomp:              {check: checkOciSeccomp},
+	flagPauseExternalNetworking: {},
 }
 
 // checkOverlay2 ensures that overlay2 can only be enabled using "memory" or
@@ -250,9 +262,9 @@ func NewFromFlags(flagSet *flag.FlagSet) (*Config, error) {
 
 	if len(conf.RootDir) == 0 {
 		// If not set, set default root dir to something (hopefully) user-writeable.
-		conf.RootDir = "/var/run/runsc"
+		conf.RootDir = defaultRootDir
 		// NOTE: empty values for XDG_RUNTIME_DIR should be ignored.
-		if runtimeDir := os.Getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
+		if runtimeDir := os.Getenv(xdgRuntimeDirEnvVar); runtimeDir != "" {
 			conf.RootDir = filepath.Join(runtimeDir, "runsc")
 		}
 	}
@@ -311,57 +323,6 @@ func (c *Config) ToFlags() []string {
 
 	// Construct a temporary set for default plumbing.
 	return rv
-}
-
-// KeyVal is a key value pair. It is used so ToContainerdConfigTOML returns
-// predictable ordering for runsc flags.
-type KeyVal struct {
-	Key string
-	Val string
-}
-
-// ContainerdConfigOptions contains arguments for ToContainerdConfigTOML.
-type ContainerdConfigOptions struct {
-	BinaryPath string
-	RootPath   string
-	Options    map[string]string
-	RunscFlags []KeyVal
-}
-
-// ToContainerdConfigTOML turns a given config into a format for a k8s containerd config.toml file.
-// See: https://gvisor.dev/docs/user_guide/containerd/quick_start/
-func (c *Config) ToContainerdConfigTOML(opts ContainerdConfigOptions) (string, error) {
-	flagSet := flag.NewFlagSet("tmp", flag.ContinueOnError)
-	RegisterFlags(flagSet)
-	keyVals := c.keyVals(flagSet, true /*onlyIfSet*/)
-	keys := []string{}
-	for k := range keyVals {
-		keys = append(keys, k)
-	}
-
-	sort.Strings(keys)
-
-	for _, k := range keys {
-		opts.RunscFlags = append(opts.RunscFlags, KeyVal{k, keyVals[k]})
-	}
-
-	const temp = `{{if .BinaryPath}}binary_name = "{{.BinaryPath}}"{{end}}
-{{if .RootPath}}root = "{{.RootPath}}"{{end}}
-{{if .Options}}{{ range $key, $value := .Options}}{{$key}} = "{{$value}}"
-{{end}}{{end}}{{if .RunscFlags}}[runsc_config]
-{{ range $fl:= .RunscFlags}}  {{$fl.Key}} = "{{$fl.Val}}"
-{{end}}{{end}}`
-
-	t := template.New("temp")
-	t, err := t.Parse(temp)
-	if err != nil {
-		return "", err
-	}
-	var buf bytes.Buffer
-	if err := t.Execute(&buf, opts); err != nil {
-		return "", err
-	}
-	return buf.String(), nil
 }
 
 func (c *Config) keyVals(flagSet *flag.FlagSet, onlyIfSet bool) map[string]string {

@@ -113,10 +113,20 @@ var (
 
 	// archState stores architecture-specific details used in the platform.
 	archState sysmsg.ArchState
+
+	// disableSyscallPatching controls if Systrap is allowed to patch
+	// syscall invocation sites.
+	//
+	// This is a hacky global and is not toggleable at runtime! Once it has
+	// been flipped for one Systrap instance, it will apply to all previously
+	// created and future instances too.
+	disableSyscallPatching bool
 )
 
 // platformContext is an implementation of the platform context.
 type platformContext struct {
+	platform.NoCPUNumbers
+
 	// signalInfo is the signal info, if and when a signal is received.
 	signalInfo linux.SignalInfo
 
@@ -204,6 +214,9 @@ func (c *platformContext) Interrupt() {
 	c.interrupt.NotifyInterrupt()
 }
 
+// Preempt implements platform.Context.Preempt.
+func (c *platformContext) Preempt() {}
+
 // Release releases all platform resources used by the platformContext.
 func (c *platformContext) Release() {
 	if c.sharedContext != nil {
@@ -212,7 +225,7 @@ func (c *platformContext) Release() {
 	}
 }
 
-// PrepareSleep implements platform.Context.platform.PrepareSleep.
+// PrepareSleep implements platform.Context.PrepareSleep.
 func (c *platformContext) PrepareSleep() {
 	ctx := c.sharedContext
 	if ctx == nil {
@@ -224,10 +237,26 @@ func (c *platformContext) PrepareSleep() {
 	}
 }
 
+// PrepareUninterruptibleSleep implements
+// platform.Context.PrepareUninterruptibleSleep.
+func (*platformContext) PrepareUninterruptibleSleep() {}
+
+// PrepareStop implements platform.Context.PrepareStop.
+func (c *platformContext) PrepareStop() {
+	c.PrepareSleep()
+}
+
+// PrepareExecve implements platform.Context.PrepareExecve.
+func (*platformContext) PrepareExecve() {}
+
+// PrepareExit implements platform.Context.PrepareExit.
+func (*platformContext) PrepareExit() {}
+
 // Systrap represents a collection of seccomp subprocesses.
 type Systrap struct {
 	platform.NoCPUPreemptionDetection
 	platform.UseHostGlobalMemoryBarrier
+	platform.NoCPUNumbers
 
 	// memoryFile is used to create a stub sysmsg stack which is shared with
 	// the Sentry. Since memoryFile is platform-private, it is never restored,
@@ -241,7 +270,11 @@ func (*Systrap) MinUserAddress() hostarch.Addr {
 }
 
 // New returns a new seccomp-based implementation of the platform interface.
-func New() (*Systrap, error) {
+func New(opts platform.Options) (*Systrap, error) {
+	if !disableSyscallPatching {
+		disableSyscallPatching = opts.DisableSyscallPatching
+	}
+
 	if maxSysmsgThreads == 0 {
 		// CPUID information has been initialized at this point.
 		archState.Init()
@@ -256,6 +289,7 @@ func New() (*Systrap, error) {
 		return nil, err
 	}
 
+	var stubErr error
 	stubInitialized.Do(func() {
 		// Don't use sentry and stub fast paths if here is just one cpu.
 		neverEnableFastPath = min(runtime.NumCPU(), runtime.GOMAXPROCS(0)) == 1
@@ -267,8 +301,8 @@ func New() (*Systrap, error) {
 		// done before initializing any other processes.
 		source, err := newSubprocess(createStub, mf, false)
 		if err != nil {
-			// Should never happen.
-			panic("unable to initialize systrap source: " + err.Error())
+			stubErr = fmt.Errorf("initialize systrap: %w", err)
+			return
 		}
 		// The source subprocess is never released explicitly by a MM.
 		source.DecRef(nil)
@@ -279,6 +313,10 @@ func New() (*Systrap, error) {
 
 		initSeccompNotify()
 	})
+	if stubErr != nil {
+		mf.Destroy()
+		return nil, stubErr
+	}
 
 	latencyMonitoring.Do(func() {
 		go controlFastPath()
@@ -289,11 +327,6 @@ func New() (*Systrap, error) {
 
 // SupportsAddressSpaceIO implements platform.Platform.SupportsAddressSpaceIO.
 func (*Systrap) SupportsAddressSpaceIO() bool {
-	return false
-}
-
-// CooperativelySchedulesAddressSpace implements platform.Platform.CooperativelySchedulesAddressSpace.
-func (*Systrap) CooperativelySchedulesAddressSpace() bool {
 	return false
 }
 
@@ -311,9 +344,8 @@ func (*Systrap) MaxUserAddress() hostarch.Addr {
 }
 
 // NewAddressSpace returns a new subprocess.
-func (p *Systrap) NewAddressSpace(any) (platform.AddressSpace, <-chan struct{}, error) {
-	as, err := newSubprocess(globalPool.source.createStub, p.memoryFile, true)
-	return as, nil, err
+func (p *Systrap) NewAddressSpace() (platform.AddressSpace, error) {
+	return newSubprocess(globalPool.source.createStub, p.memoryFile, true)
 }
 
 // NewContext returns an interruptible platformContext.
@@ -324,10 +356,15 @@ func (*Systrap) NewContext(ctx pkgcontext.Context) platform.Context {
 	}
 }
 
+// ConcurrencyCount implements platform.Platform.ConcurrencyCount.
+func (*Systrap) ConcurrencyCount() int {
+	return maxSysmsgThreads
+}
+
 type constructor struct{}
 
-func (*constructor) New(_ *fd.FD) (platform.Platform, error) {
-	return New()
+func (*constructor) New(opts platform.Options) (platform.Platform, error) {
+	return New(opts)
 }
 
 func (*constructor) OpenDevice(_ string) (*fd.FD, error) {

@@ -197,9 +197,8 @@ func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.Exe
 
 	// Write the sandbox-internal pid if required.
 	if ex.internalPidFile != "" {
-		pidStr := []byte(strconv.Itoa(int(pid)))
-		if err := os.WriteFile(ex.internalPidFile, pidStr, 0644); err != nil {
-			return util.Errorf("writing internal pid file %q: %v", ex.internalPidFile, err)
+		if err := WritePidFile(ex.internalPidFile, int(pid)); err != nil {
+			return util.Errorf("writing internal pid file: %v", err)
 		}
 	}
 
@@ -207,7 +206,7 @@ func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.Exe
 	// users can safely assume that the internal pid file is ready after
 	// `runsc exec -d` returns.
 	if ex.pidFile != "" {
-		if err := os.WriteFile(ex.pidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
+		if err := WritePidFile(ex.pidFile, os.Getpid()); err != nil {
 			return util.Errorf("writing pid file: %v", err)
 		}
 	}
@@ -376,6 +375,7 @@ func (ex *Exec) argsFromCLI(p *specs.Process, argv []string, enableRaw bool) (*c
 		ExtraKGIDs:       extraKGIDs,
 		Capabilities:     caps,
 		StdioIsPty:       ex.consoleSocket != "" || console.StdioIsPty(),
+		NoNewPrivileges:  p.NoNewPrivileges,
 	}, nil
 }
 
@@ -442,6 +442,7 @@ func argsFromProcess(specProc *specs.Process, p *specs.Process, enableRaw bool) 
 		ExtraKGIDs:       extraKGIDs,
 		Capabilities:     caps,
 		StdioIsPty:       p.Terminal,
+		NoNewPrivileges:  p.NoNewPrivileges,
 	}, nil
 }
 
@@ -449,7 +450,10 @@ func argsFromProcess(specProc *specs.Process, p *specs.Process, enableRaw bool) 
 // auth.TaskCapabilities struct with those capabilities in every capability set.
 // This mimics runc's behavior.
 func capabilities(p *specs.Process, cs []string, enableRaw bool) (*auth.TaskCapabilities, error) {
-	specCaps := *p.Capabilities
+	specCaps := specs.LinuxCapabilities{}
+	if p.Capabilities != nil {
+		specCaps = *p.Capabilities
+	}
 	for _, cap := range cs {
 		specCaps.Bounding = append(specCaps.Bounding, cap)
 		specCaps.Effective = append(specCaps.Effective, cap)
@@ -475,7 +479,7 @@ type stringSlice []string
 
 // String implements flag.Value.String.
 func (ss *stringSlice) String() string {
-	return strings.Join(*ss, ",")
+	return fmt.Sprintf("%q", *ss)
 }
 
 // Get implements flag.Value.Get.
@@ -483,9 +487,9 @@ func (ss *stringSlice) Get() any {
 	return ss
 }
 
-// Set implements flag.Value.Set. Set(String()) should be idempotent.
+// Set implements flag.Value.Set.
 func (ss *stringSlice) Set(s string) error {
-	*ss = append(*ss, strings.Split(s, ",")...)
+	*ss = append(*ss, s)
 	return nil
 }
 

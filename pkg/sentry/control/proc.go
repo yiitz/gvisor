@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
@@ -123,6 +124,9 @@ type ExecArgs struct {
 	// ExtraKGIDs is the list of additional groups to which the user belongs.
 	ExtraKGIDs []auth.KGID
 
+	// NoNewPrivileges disallows the new process from acquiring new privileges.
+	NoNewPrivileges bool
+
 	// Capabilities is the list of capabilities to give to the process.
 	Capabilities *auth.TaskCapabilities
 
@@ -204,6 +208,7 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		WorkingDirectory:     args.WorkingDirectory,
 		MountNamespace:       args.MountNamespace,
 		Credentials:          creds,
+		NoNewPrivs:           args.NoNewPrivileges,
 		Umask:                0022,
 		Limits:               limitSet,
 		MaxSymlinkTraversals: linux.MaxSymlinkTraversals,
@@ -213,12 +218,17 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		PIDNamespace:         pidns,
 		Origin:               kernel.OriginExec,
 	}
-	if initArgs.MountNamespace != nil {
-		// initArgs must hold a reference on MountNamespace, which will
-		// be donated to the new process in CreateProcess.
-		initArgs.MountNamespace.IncRef()
-	}
 	ctx := initArgs.NewContext(proc.Kernel)
+
+	if initArgs.MountNamespace == nil {
+		// Set initArgs so that 'ctx' returns the namespace.
+		initArgs.MountNamespace = proc.Kernel.GlobalInit().Leader().MountNamespace()
+	}
+	// initArgs must hold a reference on MountNamespace, which will
+	// be donated to the new process in CreateProcess.
+	initArgs.MountNamespace.IncRef()
+	mntnsCu := cleanup.Make(func() { initArgs.MountNamespace.DecRef(ctx) })
+	defer mntnsCu.Clean()
 
 	// Import file descriptors.
 	var fdTable *kernel.FDTable
@@ -230,15 +240,6 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		defer fdTable.DecRef(ctx)
 	}
 	initArgs.FDTable = fdTable
-
-	// Get the full path to the filename from the PATH env variable.
-	if initArgs.MountNamespace == nil {
-		// Set initArgs so that 'ctx' returns the namespace.
-		//
-		// Add a reference to the namespace, which is transferred to the new process.
-		initArgs.MountNamespace = proc.Kernel.GlobalInit().Leader().MountNamespace()
-		initArgs.MountNamespace.IncRef()
-	}
 
 	fdMap, execFD, err := args.unpackFiles()
 	if err != nil {
@@ -307,6 +308,7 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		initArgs.InitialCgroups = initialCgrps
 	}
 
+	mntnsCu.Release() // mntns ref is transferred to Kernel.CreateProcess()
 	tg, tid, err := proc.Kernel.CreateProcess(initArgs)
 	if err != nil {
 		return nil, 0, nil, err

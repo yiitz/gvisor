@@ -38,8 +38,8 @@ func (s *sock) beforeSave() {}
 // +checklocksignore
 func (s *sock) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
-	var timestampValue int64
-	timestampValue = s.saveTimestamp()
+	timestampValue := s.saveTimestamp()
+	_ = (int64)(timestampValue)
 	stateSinkObject.SaveValue(13, timestampValue)
 	stateSinkObject.Save(0, &s.vfsfd)
 	stateSinkObject.Save(1, &s.FileDescriptionDefaultImpl)
@@ -85,6 +85,8 @@ func (s *Stack) StateTypeName() string {
 func (s *Stack) StateFields() []string {
 	return []string{
 		"Stack",
+		"eventSubscriber",
+		"id",
 	}
 }
 
@@ -93,13 +95,17 @@ func (s *Stack) beforeSave() {}
 // +checklocksignore
 func (s *Stack) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
-	var StackValue *stack.Stack
-	StackValue = s.saveStack()
+	StackValue := s.saveStack()
+	_ = (*stack.Stack)(StackValue)
 	stateSinkObject.SaveValue(0, StackValue)
+	stateSinkObject.Save(1, &s.eventSubscriber)
+	stateSinkObject.Save(2, &s.id)
 }
 
 // +checklocksignore
 func (s *Stack) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(1, &s.eventSubscriber)
+	stateSourceObject.Load(2, &s.id)
 	stateSourceObject.LoadValue(0, new(*stack.Stack), func(y any) { s.loadStack(ctx, y.(*stack.Stack)) })
 	stateSourceObject.AfterLoad(func() { s.afterLoad(ctx) })
 }

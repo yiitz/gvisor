@@ -182,7 +182,10 @@ func (fs *filesystem) Write(ctx context.Context, fd *regularFileFD, offset int64
 		// buffer cache. Ideally we write from src to our buffer cache first.
 		// The slice passed to fs.Write() should be a slice from buffer cache.
 		data := make([]byte, writeSize)
-		cp, _ := src.CopyIn(ctx, data)
+		cp, err := src.CopyIn(ctx, data)
+		if err != nil {
+			return n, offset, err
+		}
 		data = data[:cp]
 
 		in.Header.Offset = uint64(offset)
@@ -195,6 +198,10 @@ func (fs *filesystem) Write(ctx context.Context, fd *regularFileFD, offset int64
 		if err != nil {
 			return n, offset, err
 		}
+		if err := res.Error(); err != nil {
+			return n, offset, err
+		}
+
 		out := linux.FUSEWriteOut{}
 		if err := res.UnmarshalPayload(&out); err != nil {
 			return n, offset, err
@@ -203,9 +210,6 @@ func (fs *filesystem) Write(ctx context.Context, fd *regularFileFD, offset int64
 		offset += int64(out.Size)
 		src = src.DropFirst64(int64(out.Size))
 
-		if err := res.Error(); err != nil {
-			return n, offset, err
-		}
 		// Write more than requested? EIO.
 		if out.Size > writeSize {
 			return n, offset, linuxerr.EIO

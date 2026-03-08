@@ -111,7 +111,7 @@ func (s *State) newTrapLocked(ctx context.Context, mm memoryManager) (hostarch.A
 			// next unused trap.
 			s.nextTrap = 1
 			s.tableAddr = addr
-		} else if _, err := hdr.CopyIn(task.OwnCopyContext(usermem.IOOpts{AddressSpaceActive: false}), addr); err != nil {
+		} else if _, err := hdr.CopyIn(task.OwnCopyContext(usermem.IOOpts{}), addr); err != nil {
 			return 0, err
 		} else {
 			// Read an index of a next unused trap.
@@ -193,14 +193,29 @@ func (s *State) PatchSyscall(ctx context.Context, ac *arch.Context64, mm memoryM
 		return fmt.Errorf("no task found")
 	}
 
+	// Skip syscall patching when the task is being ptraced, because
+	// single-stepping and other debugger features are incompatible with
+	// the "syshandler" routine used to handle patched syscalls (see
+	// syshandler_amd64.S). This incompatibility can result in inconsistent
+	// process states and failures (e.g. SIGSEGV).
+	// TODO(gvisor.dev/issue/11649): for a full fix we'd need to roll back
+	//     existing patched syscalls, in case the traced program was patched
+	//     before being traced (e.g. PTRACE_ATTACH on an already running
+	//     process).
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if task.Tracer() != nil {
+		if s.nextTrap > 0 {
+			ctx.Warningf("LIKELY ERROR: Attached tracer to process with patched syscalls (traps %d)! Systrap is not fully compatible with ptrace/debuggers, program may die unexpectedly soon! Use `--systrap-disable-syscall-patching` as a workaround.", s.nextTrap)
+		}
+		return nil
+	}
 
 	sysno := ac.SyscallNo()
 	patchAddr := ac.IP() - uintptr(len(jmpInst))
 
 	prevCode := make([]uint8, len(jmpInst))
-	if _, err := primitive.CopyUint8SliceIn(task.OwnCopyContext(usermem.IOOpts{AddressSpaceActive: false}), hostarch.Addr(patchAddr), prevCode); err != nil {
+	if _, err := primitive.CopyUint8SliceIn(task, hostarch.Addr(patchAddr), prevCode); err != nil {
 		return err
 	}
 
@@ -297,7 +312,7 @@ func (s *State) HandleFault(ctx context.Context, ac *arch.Context64, mm memoryMa
 
 	code := make([]uint8, len(jmpInst))
 	ip := ac.IP() - faultInstOffset
-	if _, err := primitive.CopyUint8SliceIn(task.OwnCopyContext(usermem.IOOpts{AddressSpaceActive: false}), hostarch.Addr(ip), code); err != nil {
+	if _, err := primitive.CopyUint8SliceIn(task, hostarch.Addr(ip), code); err != nil {
 		return err
 	}
 

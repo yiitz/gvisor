@@ -15,6 +15,7 @@
 package systrap
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
@@ -186,6 +187,7 @@ func initSeccompNotify() {
 	switch errno {
 	case unix.EFAULT:
 		// seccomp unotify is supported.
+		seccompNotifyIsSupported = true
 	case unix.EINVAL:
 		log.Warningf("Seccomp user-space notification mechanism isn't " +
 			"supported by the kernel (available since Linux 5.0).")
@@ -210,7 +212,7 @@ func (s *subprocess) initSyscallThread(ptraceThread *thread, seccompNotify bool)
 	}
 
 	if err := t.init(seccompNotify); err != nil {
-		panic(fmt.Sprintf("failed to create a syscall thread"))
+		panic("failed to create a syscall thread")
 	}
 	s.syscallThread = &t
 
@@ -220,13 +222,13 @@ func (s *subprocess) initSyscallThread(ptraceThread *thread, seccompNotify bool)
 }
 
 func handlePtraceSyscallRequestError(req any, format string, values ...any) {
-	switch req.(type) {
+	switch req := req.(type) {
 	case requestThread:
-		req.(requestThread).thread <- nil
+		req.thread <- nil
 	case requestStub:
-		req.(requestStub).done <- nil
+		req.done <- nil
 	}
-	log.Warningf("handlePtraceSyscallRequest failed: "+format, values...)
+	log.BugTracebackf("handlePtraceSyscallRequest failed: "+format, values...)
 }
 
 // handlePtraceSyscallRequest executes system calls that can't be run via
@@ -277,6 +279,25 @@ func (s *subprocess) handlePtraceSyscallRequest(req any) {
 		if err != nil {
 			handlePtraceSyscallRequestError(req, "prctl: %v", err)
 			return
+		}
+
+		// Enable syscall user dispatch for trapping guest system calls.
+		// This mechanism, introduced in kernel 5.11, is generally more
+		// efficient than seccomp. On old kernels, syscalls will be
+		// trapped by seccomp.
+		_, err = t.syscallIgnoreInterrupt(&t.initRegs, unix.SYS_PRCTL,
+			arch.SyscallArgument{Value: unix.PR_SET_SYSCALL_USER_DISPATCH},
+			arch.SyscallArgument{Value: unix.PR_SYS_DISPATCH_ON},
+			arch.SyscallArgument{Value: stubStart},
+			arch.SyscallArgument{Value: stubROMapEnd - stubStart},
+			arch.SyscallArgument{Value: 0})
+		if err != nil {
+			if errors.Is(err, unix.EINVAL) {
+				t.Debugf("PR_SET_SYSCALL_USER_DISPATCH isn't supported. User syscalls will be trapped by seccomp.")
+			} else {
+				handlePtraceSyscallRequestError(req, "prctl: %v", err)
+				return
+			}
 		}
 
 		id, ok := s.sysmsgStackPool.Get()
@@ -422,7 +443,7 @@ func (s *subprocess) mapSharedRegions() {
 	// Map thread context region into the sentry.
 	threadContextFR, err := s.memoryFile.Allocate(uint64(stubContextRegionLen), opts)
 	if err != nil {
-		panic(fmt.Sprintf("failed to allocate a new subprocess context memory region"))
+		panic("failed to allocate a new subprocess context memory region")
 	}
 	sentryThreadContextRegionAddr, errno := hostsyscall.RawSyscall6(
 		unix.SYS_MMAP,
@@ -665,7 +686,7 @@ func (t *thread) wait(outcome waitOutcome) unix.Signal {
 	}
 }
 
-// kill kills the thread;
+// kill kills the thread.
 func (t *thread) kill() {
 	unix.Tgkill(int(t.tgid), int(t.tid), unix.Signal(unix.SIGKILL))
 }
@@ -825,7 +846,9 @@ func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSysc
 	threadID := ctx.threadID()
 	if threadID != invalidThreadID {
 		if sysThread, ok := s.sysmsgThreads[threadID]; ok && sysThread.msg.Err != 0 {
-			return false, false, hostarch.NoAccess, sysThread.msg.ConvertSysmsgErr()
+			sysmsgErr := sysThread.msg.ConvertSysmsgErr()
+			log.BugTraceback(sysmsgErr)
+			return false, false, hostarch.NoAccess, sysmsgErr
 		}
 		return false, false, hostarch.NoAccess, corruptedSharedMemoryErr(fmt.Sprintf("found unexpected ThreadContext.ThreadID field, expected %d found %d", invalidThreadID, threadID))
 	}
@@ -843,13 +866,17 @@ func (s *subprocess) switchToApp(c *platformContext, ac *arch.Context64) (isSysc
 		ctxState = sysmsg.ContextStateSyscall
 		shouldPatchSyscall = true
 	}
-
 	if ctxState == sysmsg.ContextStateSyscall || ctxState == sysmsg.ContextStateSyscallTrap {
 		if maybePatchSignalInfo(regs, &c.signalInfo) {
 			return false, false, hostarch.Execute, nil
 		}
 		updateSyscallRegs(regs)
 		return true, shouldPatchSyscall, hostarch.NoAccess, nil
+	} else if ctxState == sysmsg.ContextStateUnexpectedDeath {
+		return false, shouldPatchSyscall, hostarch.NoAccess, &platform.ContextError{
+			Err:   fmt.Errorf("systrap unexpected death"),
+			Errno: unix.ECHILD,
+		}
 	} else if ctxState != sysmsg.ContextStateFault {
 		return false, false, hostarch.NoAccess, corruptedSharedMemoryErr(fmt.Sprintf("unknown context state: %v", ctxState))
 	}
@@ -1157,7 +1184,10 @@ func (s *subprocess) createSysmsgThread() error {
 	if err := p.setRegs(tregs); err != nil {
 		panic(fmt.Sprintf("ptrace set regs failed: %v", err))
 	}
-	archSpecificSysmsgThreadInit(sysThread)
+	// Send a fake event to stop the BPF process so that it enters the sighandler.
+	if e := hostsyscall.RawSyscallErrno(unix.SYS_TGKILL, uintptr(sysThread.thread.tgid), uintptr(sysThread.thread.tid), uintptr(unix.SIGSEGV)); e != 0 {
+		panic(fmt.Sprintf("tkill failed: %v", e))
+	}
 	// Skip SIGSTOP.
 	if e := hostsyscall.RawSyscallErrno(unix.SYS_TGKILL, uintptr(p.tgid), uintptr(p.tid), uintptr(unix.SIGCONT)); e != 0 {
 		panic(fmt.Sprintf("tkill failed: %v", e))

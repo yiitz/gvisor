@@ -46,7 +46,6 @@ type processor struct {
 
 func (p *processor) start(wg *sync.WaitGroup) {
 	defer wg.Done()
-	defer p.sleeper.Done()
 	for {
 		switch w := p.sleeper.Fetch(true); {
 		case w == &p.packetWaker:
@@ -128,9 +127,10 @@ func (m *processorManager) start() {
 }
 
 // afterLoad is invoked by stateify.
-func (m *processorManager) afterLoad(context.Context) {
-	m.wg.Add(len(m.processors))
-	m.start()
+func (m *processorManager) afterLoad(ctx context.Context) {
+	// Close all the old/saved processors. There are new NICs and
+	// processors created during restore.
+	m.close()
 }
 
 func (m *processorManager) connectionHash(cid *connectionID) uint32 {

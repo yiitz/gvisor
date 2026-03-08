@@ -384,7 +384,7 @@ func (s *syntheticTimerSet) InsertWithoutMergingUnchecked(gap syntheticTimerGapI
 	if splitMaxGap {
 		gap.node.updateMaxGapLeaf()
 	}
-	return syntheticTimerIterator{gap.node, gap.index}
+	return syntheticTimerIterator(gap)
 }
 
 // InsertRange inserts the given segment into the set. If the new segment can
@@ -513,7 +513,7 @@ func (s *syntheticTimerSet) Remove(seg syntheticTimerIterator) syntheticTimerGap
 	if syntheticTimertrackGaps != 0 {
 		seg.node.updateMaxGapLeaf()
 	}
-	return seg.node.rebalanceAfterRemove(syntheticTimerGapIterator{seg.node, seg.index})
+	return seg.node.rebalanceAfterRemove(syntheticTimerGapIterator(seg))
 }
 
 // RemoveAll removes all segments from the set. All existing iterators are
@@ -596,6 +596,19 @@ func (s *syntheticTimerSet) RemoveFullRangeWith(r uint64Range, f func(seg synthe
 			panic(fmt.Sprintf("missing segment at %v", end))
 		}
 	}
+}
+
+// MoveFrom moves all segments from s2 to s, replacing all existing segments in
+// s and leaving s2 empty.
+func (s *syntheticTimerSet) MoveFrom(s2 *syntheticTimerSet) {
+	*s = *s2
+	for _, child := range s.root.children {
+		if child == nil {
+			break
+		}
+		child.parent = &s.root
+	}
+	s2.RemoveAll()
 }
 
 // Merge attempts to merge two neighboring segments. If successful, Merge
@@ -1609,7 +1622,7 @@ func (seg syntheticTimerIterator) PrevGap() syntheticTimerGapIterator {
 
 		return seg.node.children[seg.index].lastSegment().NextGap()
 	}
-	return syntheticTimerGapIterator{seg.node, seg.index}
+	return syntheticTimerGapIterator(seg)
 }
 
 // NextGap returns the gap immediately after the iterated segment.
@@ -1901,26 +1914,26 @@ func (n *syntheticTimernode) String() string {
 func (n *syntheticTimernode) writeDebugString(buf *bytes.Buffer, prefix string) {
 	if n.hasChildren != (n.nrSegments > 0 && n.children[0] != nil) {
 		buf.WriteString(prefix)
-		buf.WriteString(fmt.Sprintf("WARNING: inconsistent value of hasChildren: got %v, want %v\n", n.hasChildren, !n.hasChildren))
+		fmt.Fprintf(buf, "WARNING: inconsistent value of hasChildren: got %v, want %v\n", n.hasChildren, !n.hasChildren)
 	}
 	for i := 0; i < n.nrSegments; i++ {
 		if child := n.children[i]; child != nil {
 			cprefix := fmt.Sprintf("%s- % 3d ", prefix, i)
 			if child.parent != n || child.parentIndex != i {
 				buf.WriteString(cprefix)
-				buf.WriteString(fmt.Sprintf("WARNING: inconsistent linkage to parent: got (%p, %d), want (%p, %d)\n", child.parent, child.parentIndex, n, i))
+				fmt.Fprintf(buf, "WARNING: inconsistent linkage to parent: got (%p, %d), want (%p, %d)\n", child.parent, child.parentIndex, n, i)
 			}
 			child.writeDebugString(buf, fmt.Sprintf("%s- % 3d ", prefix, i))
 		}
 		buf.WriteString(prefix)
 		if n.hasChildren {
 			if syntheticTimertrackGaps != 0 {
-				buf.WriteString(fmt.Sprintf("- % 3d: %v => %v, maxGap: %d\n", i, n.keys[i], n.values[i], n.maxGap.Get()))
+				fmt.Fprintf(buf, "- % 3d: %v => %v, maxGap: %d\n", i, n.keys[i], n.values[i], n.maxGap.Get())
 			} else {
-				buf.WriteString(fmt.Sprintf("- % 3d: %v => %v\n", i, n.keys[i], n.values[i]))
+				fmt.Fprintf(buf, "- % 3d: %v => %v\n", i, n.keys[i], n.values[i])
 			}
 		} else {
-			buf.WriteString(fmt.Sprintf("- % 3d: %v => %v\n", i, n.keys[i], n.values[i]))
+			fmt.Fprintf(buf, "- % 3d: %v => %v\n", i, n.keys[i], n.values[i])
 		}
 	}
 	if child := n.children[n.nrSegments]; child != nil {

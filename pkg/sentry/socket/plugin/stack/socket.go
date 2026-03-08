@@ -94,7 +94,7 @@ func newSocket(t *kernel.Task, family int, skType linux.SockType, protocol int, 
 	sop.LockFD.Init(&vfs.FileLocks{})
 
 	vfsfd := &sop.vfsfd
-	if err := vfsfd.Init(sop, linux.O_RDWR|(flags&linux.O_NONBLOCK), mnt, d, &vfs.FileDescriptionOptions{
+	if err := vfsfd.Init(sop, linux.O_RDWR|(flags&linux.O_NONBLOCK), t.Credentials(), mnt, d, &vfs.FileDescriptionOptions{
 		DenyPRead:         true,
 		DenyPWrite:        true,
 		UseDentryMetadata: true,
@@ -471,9 +471,7 @@ func (s *socketOperations) Ioctl(ctx context.Context, io usermem.IO, sysno uintp
 		syscall.SIOCGIFTXQLEN:
 		var ifr linux.IFReq
 		ifrBuf := ctx.(*kernel.Task).CopyScratchBuffer(linux.SizeOfIFReq)
-		if _, err := io.CopyIn(ctx, args[2].Pointer(), ifrBuf, usermem.IOOpts{
-			AddressSpaceActive: true,
-		}); err != nil {
+		if _, err := io.CopyIn(ctx, args[2].Pointer(), ifrBuf, usermem.IOOpts{}); err != nil {
 			return 0, err
 		}
 		// Decode ifr from ifrBuf
@@ -485,9 +483,7 @@ func (s *socketOperations) Ioctl(ctx context.Context, io usermem.IO, sysno uintp
 		}
 		copy(ifrBuf[0:linux.IFNAMSIZ], ifr.IFName[0:linux.IFNAMSIZ])
 		copy(ifrBuf[linux.IFNAMSIZ:linux.SizeOfIFReq], ifr.Data[0:linux.SizeOfIFReq-linux.IFNAMSIZ])
-		_, err := io.CopyOut(ctx, arg, ifrBuf, usermem.IOOpts{
-			AddressSpaceActive: true,
-		})
+		_, err := io.CopyOut(ctx, arg, ifrBuf, usermem.IOOpts{})
 		return 0, err
 
 	case syscall.SIOCGIFCONF:
@@ -495,9 +491,7 @@ func (s *socketOperations) Ioctl(ctx context.Context, io usermem.IO, sysno uintp
 		// will need to populate the array of ifreqs.
 		var ifc linux.IFConf
 		ifcBuf := ctx.(*kernel.Task).CopyScratchBuffer(linux.SizeOfIFConf)
-		if _, err := io.CopyIn(ctx, arg, ifcBuf, usermem.IOOpts{
-			AddressSpaceActive: true,
-		}); err != nil {
+		if _, err := io.CopyIn(ctx, arg, ifcBuf, usermem.IOOpts{}); err != nil {
 			return 0, err
 		}
 		// Decode ifc from ifcBuf
@@ -510,9 +504,7 @@ func (s *socketOperations) Ioctl(ctx context.Context, io usermem.IO, sysno uintp
 		}
 		hostarch.ByteOrder.PutUint32(ifcBuf[0:4], uint32(ifc.Len))
 		hostarch.ByteOrder.PutUint64(ifcBuf[8:], ifc.Ptr)
-		_, err := io.CopyOut(ctx, arg, ifcBuf, usermem.IOOpts{
-			AddressSpaceActive: true,
-		})
+		_, err := io.CopyOut(ctx, arg, ifcBuf, usermem.IOOpts{})
 
 		return 0, err
 	case linux.SIOCGIFMEM, linux.SIOCGIFPFLAGS, linux.SIOCGMIIPHY, linux.SIOCGMIIREG:
@@ -532,9 +524,7 @@ func (s *socketOperations) Ioctl(ctx context.Context, io usermem.IO, sysno uintp
 		return 0, err
 	}
 
-	_, err := io.CopyOut(ctx, arg, buf, usermem.IOOpts{
-		AddressSpaceActive: true,
-	})
+	_, err := io.CopyOut(ctx, arg, buf, usermem.IOOpts{})
 
 	return 0, err
 }
@@ -567,6 +557,11 @@ func (s *socketOperations) GetPeerName(t *kernel.Task) (linux.SockAddr, uint32, 
 		return nil, 0, int2err(rc)
 	}
 	return socket.UnmarshalSockAddr(s.family, addr), addrlen, nil
+}
+
+// GetPeerCreds implements socket.Socket.GetPeerCreds.
+func (s *socketOperations) GetPeerCreds(t *kernel.Task) (marshal.Marshallable, *syserr.Error) {
+	return nil, syserr.ErrInvalidEndpointState
 }
 
 // recv is a helper function for doing non-blocking read once.
@@ -633,7 +628,7 @@ func (s *socketOperations) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags
 
 	// Store nonblock info from original flag.
 	nonblock := flags&syscall.MSG_DONTWAIT != 0
-	waitall := nonblock == false && flags&syscall.MSG_WAITALL != 0
+	waitall := !nonblock && flags&syscall.MSG_WAITALL != 0
 
 	var mflag int
 	var n int64

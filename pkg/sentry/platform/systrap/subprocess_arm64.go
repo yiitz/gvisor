@@ -77,7 +77,6 @@ func createSyscallRegs(initRegs *arch.Registers, sysno uintptr, args ...arch.Sys
 // updateSyscallRegs updates registers after finishing sysemu.
 func updateSyscallRegs(regs *arch.Registers) {
 	// No special work is necessary.
-	return
 }
 
 // syscallReturnValue extracts a sensible return from registers.
@@ -168,7 +167,7 @@ func (s *subprocess) arm64SyscallWorkaround(t *thread, regs *arch.Registers) {
 			continue
 		}
 		if sig == (syscallEvent | unix.SIGTRAP) {
-			t.dumpAndPanic(fmt.Sprintf("unexpected syscall event"))
+			t.dumpAndPanic("unexpected syscall event")
 		}
 		break
 	}
@@ -187,13 +186,6 @@ func setArchSpecificRegs(sysThread *sysmsgThread, regs *arch.Registers) {
 func retrieveArchSpecificState(ctx *sysmsg.ThreadContext, ac *arch.Context64) {
 	if !ac.SetTLS(uintptr(ctx.TLS)) {
 		panic(fmt.Sprintf("ac.SetTLS(%+v) failed", ctx.TLS))
-	}
-}
-
-func archSpecificSysmsgThreadInit(sysThread *sysmsgThread) {
-	// Send a fake event to stop the BPF process so that it enters the sighandler.
-	if e := hostsyscall.RawSyscallErrno(unix.SYS_TGKILL, uintptr(sysThread.thread.tgid), uintptr(sysThread.thread.tid), uintptr(unix.SIGSEGV)); e != 0 {
-		panic(fmt.Sprintf("tkill failed: %v", e))
 	}
 }
 

@@ -40,6 +40,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
+	"gvisor.dev/gvisor/pkg/tcpip/nftables"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
@@ -187,6 +189,21 @@ type Boot struct {
 
 	// nvidiaDriverVersion is the Nvidia driver version on the host.
 	nvidiaDriverVersion string
+
+	// These correspond to fields in nvconf.HostSettings, which is not used
+	// here because nvconf.HostSettings.FabricIMEXManagementDevMinor in
+	// particular is uint32 and there is no flag.Uint32Var().
+	procDriverNvidiaParams             string
+	nvidiaFabricIMEXManagementDevMinor int64
+
+	// uid and gid are the user and group IDs to switch to after setting up the user namespace.
+	uid int
+	gid int
+
+	bootExtra
+
+	// rootfsUpperTarFD is the file descriptor to a tar file that has rootfs change at startup.
+	rootfsUpperTarFD int
 }
 
 // Name implements subcommands.Command.Name.
@@ -216,9 +233,10 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.Uint64Var(&b.totalHostMem, "total-host-memory", 0, "total memory reported by host /proc/meminfo")
 	f.BoolVar(&b.attached, "attached", false, "if attached is true, kills the sandbox process when the parent process terminates")
 	f.StringVar(&b.productName, "product-name", "", "value to show in /sys/devices/virtual/dmi/id/product_name")
-	f.StringVar(&b.nvidiaDriverVersion, "nvidia-driver-version", "", "Nvidia driver version on the host")
 	f.StringVar(&b.hostTHP.ShmemEnabled, "host-thp-shmem-enabled", "", "value of /sys/kernel/mm/transparent_hugepage/shmem_enabled on the host")
 	f.StringVar(&b.hostTHP.Defrag, "host-thp-defrag", "", "value of /sys/kernel/mm/transparent_hugepage/defrag on the host")
+	f.IntVar(&b.uid, "uid", 0, "user ID")
+	f.IntVar(&b.gid, "gid", 0, "user ID")
 
 	// Open FDs that are donated to the sandbox.
 	f.IntVar(&b.specFD, "spec-fd", -1, "required fd with the container spec")
@@ -237,12 +255,20 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&b.podInitConfigFD, "pod-init-config-fd", -1, "file descriptor to the pod init configuration file.")
 	f.Var(&b.sinkFDs, "sink-fds", "ordered list of file descriptors to be used by the sinks defined in --pod-init-config.")
 	f.Var(&b.saveFDs, "save-fds", "ordered list of file descriptors to be used save checkpoints. Order: kernel state, page metadata, page file")
+	f.IntVar(&b.rootfsUpperTarFD, "rootfs-upper-tar-fd", -1, "file descriptor to the tar file containing the rootfs upper layer changes.")
 
 	// Profiling flags.
 	b.profileFDs.SetFromFlags(f)
 	f.IntVar(&b.finalMetricsFD, "final-metrics-log-fd", -1, "file descriptor to write metrics to upon sandbox termination.")
 	f.IntVar(&b.profilingMetricsFD, "profiling-metrics-fd", -1, "file descriptor to write sentry profiling metrics.")
 	f.BoolVar(&b.profilingMetricsLossy, "profiling-metrics-fd-lossy", false, "if true, treat the sentry profiling metrics FD as lossy and write a checksum to it.")
+
+	// Nvidia driver properties.
+	f.StringVar(&b.nvidiaDriverVersion, "nvidia-driver-version", "", "Nvidia driver version on the host")
+	f.StringVar(&b.procDriverNvidiaParams, "nvidia-host-params", "", "value of /proc/driver/nvidia/params on the host")
+	f.Int64Var(&b.nvidiaFabricIMEXManagementDevMinor, "nvidia-fabric-imex-mgmt-minor", -1, "DeviceFileMinor in /proc/driver/nvidia/capabilities/fabric-imex-mgmt on the host")
+
+	b.setFlagsExtra(f)
 }
 
 // Execute implements subcommands.Command.Execute.  It starts a sandbox in a
@@ -266,7 +292,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 
 	argOverride := make(map[string]string)
 
-	// Do these before chroot takes effect, otherwise we can't read /sys.
+	// Do these before chroot takes effect, otherwise we can't read /proc and /sys.
 	if len(b.productName) == 0 {
 		if product, err := os.ReadFile("/sys/devices/virtual/dmi/id/product_name"); err != nil {
 			log.Warningf("Not setting product_name: %v", err)
@@ -290,11 +316,27 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		if len(b.hostTHP.Defrag) == 0 {
 			val, err := hostmm.ReadTransparentHugepageEnum("defrag")
 			if err != nil {
-				log.Warningf("Failed to infer --host-thp-defrag", err)
+				log.Warningf("Failed to infer --host-thp-defrag: %v", err)
 			} else {
 				b.hostTHP.Defrag = val
 				log.Infof("Setting host-thp-defrag: %q", b.hostTHP.Defrag)
 				argOverride["host-thp-defrag"] = b.hostTHP.Defrag
+			}
+		}
+	}
+	if conf.NVProxy && b.procDriverNvidiaParams == "" {
+		driverCaps, driverCapsErr := specutils.NVProxyDriverCapsAllowed(conf)
+		nvhs, err := nvconf.GetHostSettings(nvconf.HostSettingsOptions{
+			WantFabricIMEXManagement: driverCapsErr == nil && driverCaps&nvconf.CapFabricIMEXManagement != 0,
+		})
+		if err != nil {
+			log.Warningf("Failed to get nvconf.HostSettings: %v", err)
+		} else {
+			b.procDriverNvidiaParams = nvhs.ProcDriverNvidiaParams
+			argOverride["nvidia-host-params"] = nvhs.ProcDriverNvidiaParams
+			if nvhs.HaveFabricIMEXManagement {
+				b.nvidiaFabricIMEXManagementDevMinor = int64(nvhs.FabricIMEXManagementDevMinor)
+				argOverride["nvidia-fabric-imex-mgmt-minor"] = strconv.FormatUint(uint64(nvhs.FabricIMEXManagementDevMinor), 10)
 			}
 		}
 	}
@@ -309,7 +351,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	}
 
 	if b.syncUsernsFD >= 0 {
-		syncUsernsForRootless(b.syncUsernsFD)
+		syncUsernsForRootless(b.syncUsernsFD, uint32(b.uid), uint32(b.gid))
 		argOverride["sync-userns-fd"] = "-1"
 	}
 
@@ -494,6 +536,11 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		log.Infof("Core tag enabled (core tag=%d)", coreTags[0])
 	}
 
+	// NFtables is only supported for netstack.
+	if (conf.Network == config.NetworkNone || conf.Network == config.NetworkSandbox) && conf.Nftables {
+		nftables.EnableNFTables()
+	}
+
 	var nvidiaDriverVersion nvconf.DriverVersion
 	if b.nvidiaDriverVersion != "" {
 		nvidiaDriverVersion, err = nvconf.DriverVersionFrom(b.nvidiaDriverVersion)
@@ -501,6 +548,8 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 			util.Fatalf("Failed to parse nvidia driver version: %v", err)
 		}
 	}
+
+	linux.SetAFSSyscallPanic(conf.TestOnlyAFSSyscallPanic)
 
 	// Create the loader.
 	bootArgs := boot.Args{
@@ -523,11 +572,18 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		ProductName:         b.productName,
 		PodInitConfigFD:     b.podInitConfigFD,
 		SinkFDs:             b.sinkFDs.GetArray(),
-		ProfileOpts:         b.profileFDs.ToOpts(),
+		ProfileOpts:         profile.MakeOpts(&b.profileFDs, conf.ProfileGCInterval),
 		NvidiaDriverVersion: nvidiaDriverVersion,
-		HostTHP:             b.hostTHP,
-		SaveFDs:             b.saveFDs.GetFDs(),
+		NvidiaHostSettings: &nvconf.HostSettings{
+			ProcDriverNvidiaParams:       b.procDriverNvidiaParams,
+			HaveFabricIMEXManagement:     b.nvidiaFabricIMEXManagementDevMinor >= 0,
+			FabricIMEXManagementDevMinor: uint32(b.nvidiaFabricIMEXManagementDevMinor),
+		},
+		HostTHP:          b.hostTHP,
+		SaveFDs:          b.saveFDs.GetFDs(),
+		RootfsUpperTarFD: b.rootfsUpperTarFD,
 	}
+	b.setBootArgsExtra(&bootArgs)
 	l, err := boot.New(bootArgs)
 	if err != nil {
 		util.Fatalf("creating loader: %v", err)

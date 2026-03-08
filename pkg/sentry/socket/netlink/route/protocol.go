@@ -24,7 +24,6 @@ import (
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netlink"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/nlmsg"
 	"gvisor.dev/gvisor/pkg/syserr"
@@ -69,6 +68,12 @@ func (p *Protocol) CanSend() bool {
 	return true
 }
 
+// Receive implements netlink.Protocol.Receive.
+// From net/core/rtnetlink.c:rtnetlink_rcv.
+func (p *Protocol) Receive(ctx context.Context, s *netlink.Socket, buf []byte) *syserr.Error {
+	return s.ProcessMessages(ctx, buf)
+}
+
 // dumpLinks handles RTM_GETLINK dump requests.
 func (p *Protocol) dumpLinks(ctx context.Context, s *netlink.Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error {
 	// NLM_F_DUMP + RTM_GETLINK messages are supposed to include an
@@ -95,7 +100,7 @@ func (p *Protocol) dumpLinks(ctx context.Context, s *netlink.Socket, msg *nlmsg.
 	}
 
 	for idx, i := range stack.Interfaces() {
-		addNewLinkMessage(ms, idx, i)
+		p.AddNewLinkMessage(ms, idx, i)
 	}
 
 	return nil
@@ -152,7 +157,7 @@ func (p *Protocol) getLink(ctx context.Context, s *netlink.Socket, msg *nlmsg.Me
 			return syserr.ErrInvalidArgument
 		}
 
-		addNewLinkMessage(ms, idx, i)
+		p.AddNewLinkMessage(ms, idx, i)
 		found = true
 		break
 	}
@@ -226,16 +231,10 @@ func (p *Protocol) delLink(ctx context.Context, s *netlink.Socket, msg *nlmsg.Me
 			return syserr.ErrNoDevice
 		}
 	}
-	return syserr.FromError(stack.RemoveInterface(ifinfomsg.Index))
+	return syserr.FromError(stack.RemoveInterface(ctx, ifinfomsg.Index))
 }
 
-// addNewLinkMessage appends RTM_NEWLINK message for the given interface into
-// the message set.
-func addNewLinkMessage(ms *nlmsg.MessageSet, idx int32, i inet.Interface) {
-	m := ms.AddMessage(linux.NetlinkMessageHeader{
-		Type: linux.RTM_NEWLINK,
-	})
-
+func writeLinkInfo(m *nlmsg.Message, idx int32, i inet.Interface) {
 	m.Put(&linux.InterfaceInfoMessage{
 		Family: linux.AF_UNSPEC,
 		Type:   i.DeviceType,
@@ -254,8 +253,31 @@ func addNewLinkMessage(ms *nlmsg.MessageSet, idx int32, i inet.Interface) {
 	}
 	m.PutAttr(linux.IFLA_ADDRESS, primitive.AsByteSlice(mac))
 	m.PutAttr(linux.IFLA_BROADCAST, primitive.AsByteSlice(brd))
+	if i.Master != 0 {
+		m.PutAttr(linux.IFLA_MASTER, primitive.AllocateUint32(i.Master))
+	}
 
 	// TODO(gvisor.dev/issue/578): There are many more attributes.
+}
+
+// AddNewLinkMessage appends an RTM_NEWLINK message for the given interface into
+// the message set.
+// AddNewLinkMessage implements netlink.RouteProtocol.AddNewLinkMessage.
+func (p *Protocol) AddNewLinkMessage(ms *nlmsg.MessageSet, idx int32, i inet.Interface) {
+	m := ms.AddMessage(linux.NetlinkMessageHeader{
+		Type: linux.RTM_NEWLINK,
+	})
+	writeLinkInfo(m, idx, i)
+}
+
+// AddDelLinkMessage appends an RTM_DELLINK message for the given interface into
+// the message set.
+// AddDelLinkMessage implements netlink.RouteProtocol.AddDelLinkMessage.
+func (p *Protocol) AddDelLinkMessage(ms *nlmsg.MessageSet, idx int32, i inet.Interface) {
+	m := ms.AddMessage(linux.NetlinkMessageHeader{
+		Type: linux.RTM_DELLINK,
+	})
+	writeLinkInfo(m, idx, i)
 }
 
 // dumpAddrs handles RTM_GETADDR dump requests.
@@ -613,9 +635,8 @@ func (p *Protocol) ProcessMessage(ctx context.Context, s *netlink.Socket, msg *n
 
 	// Non-GET message types require CAP_NET_ADMIN.
 	if typeKind(hdr.Type) != kindGet {
-		creds := auth.CredentialsFromContext(ctx)
-		if !creds.HasCapability(linux.CAP_NET_ADMIN) {
-			return syserr.ErrPermissionDenied
+		if !s.NetworkNamespace().HasCapability(ctx, linux.CAP_NET_ADMIN) {
+			return syserr.ErrNotPermittedNet
 		}
 	}
 

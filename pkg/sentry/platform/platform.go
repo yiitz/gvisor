@@ -43,15 +43,6 @@ type Platform interface {
 	// unchanged over the lifetime of the Platform.
 	SupportsAddressSpaceIO() bool
 
-	// CooperativelySchedulesAddressSpace returns true if the Platform has a
-	// limited number of AddressSpaces, such that mm.MemoryManager.Deactivate
-	// should call AddressSpace.Release when there are no goroutines that
-	// require the mm.MemoryManager to have an active AddressSpace.
-	//
-	// The value returned by CooperativelySchedulesAddressSpace is guaranteed
-	// to remain unchanged over the lifetime of the Platform.
-	CooperativelySchedulesAddressSpace() bool
-
 	// DetectsCPUPreemption returns true if Contexts returned by the Platform
 	// can reliably return ErrContextCPUPreempted.
 	DetectsCPUPreemption() bool
@@ -77,24 +68,21 @@ type Platform interface {
 	MaxUserAddress() hostarch.Addr
 
 	// NewAddressSpace returns a new memory context for this platform.
-	//
-	// If mappingsID is not nil, the platform may assume that (1) all calls
-	// to NewAddressSpace with the same mappingsID represent the same
-	// (mutable) set of mappings, and (2) the set of mappings has not
-	// changed since the last time AddressSpace.Release was called on an
-	// AddressSpace returned by a call to NewAddressSpace with the same
-	// mappingsID.
-	//
-	// If a new AddressSpace cannot be created immediately, a nil
-	// AddressSpace is returned, along with channel that is closed when
-	// the caller should retry a call to NewAddressSpace.
-	//
-	// In general, this blocking behavior only occurs when
-	// CooperativelySchedulesAddressSpace (above) returns false.
-	NewAddressSpace(mappingsID any) (AddressSpace, <-chan struct{}, error)
+	NewAddressSpace() (AddressSpace, error)
 
 	// NewContext returns a new execution context.
 	NewContext(context.Context) Context
+
+	// PreemptAllCPUs causes all concurrent calls to Context.Switch() on the given CPU, as well
+	// as the first following call to Context.Switch() for each Context, to
+	// return ErrContextCPUPreempted.
+	//
+	// Precondition(s): cpu must be in the range [0, NumCPUs()).
+	//
+	// PreemptCPU is only supported if DetectsCPUPremption() && HasCPUNumbers() == true.
+	// Platforms for which this does not hold may panic if PreemptCPU is
+	// called.
+	PreemptCPU(cpu int32) error
 
 	// PreemptAllCPUs causes all concurrent calls to Context.Switch(), as well
 	// as the first following call to Context.Switch() for each Context, to
@@ -116,6 +104,17 @@ type Platform interface {
 
 	// SeccompInfo returns seccomp-related information about this platform.
 	SeccompInfo() SeccompInfo
+
+	// ConcurrencyCount returns the maximum number of contexts that can run
+	// in parallel. Concurrent calls to Context.Switch() beyond
+	// ConcurrencyCount() may block until previous calls have returned.
+	ConcurrencyCount() int
+
+	// HasCPUNumbers returns true if the platform assigns CPU numbers to contexts.
+	HasCPUNumbers() bool
+
+	// NumCPUs returns the number of CPUs on the platform.
+	NumCPUs() int
 }
 
 // NoCPUPreemptionDetection implements Platform.DetectsCPUPreemption and
@@ -130,6 +129,25 @@ func (NoCPUPreemptionDetection) DetectsCPUPreemption() bool {
 // PreemptAllCPUs implements Platform.PreemptAllCPUs.
 func (NoCPUPreemptionDetection) PreemptAllCPUs() error {
 	panic("This platform does not support CPU preemption detection")
+}
+
+// NoCPUNumbers implements Platform.HasCPUNumbers for platforms that do
+// not support it.
+type NoCPUNumbers struct{}
+
+// HasCPUNumbers implements Platform.HasCPUNumbers.
+func (NoCPUNumbers) HasCPUNumbers() bool {
+	return false
+}
+
+// NumCPUs implements Platform.NumCPUs.
+func (NoCPUNumbers) NumCPUs() int {
+	panic("platform does not support CPU numbers")
+}
+
+// PreemptCPU implements Platform.PreemptCPU.
+func (NoCPUNumbers) PreemptCPU(int32) error {
+	panic("platform does not support preempting a specific CPU")
 }
 
 // UseHostGlobalMemoryBarrier implements Platform.HaveGlobalMemoryBarrier and
@@ -246,12 +264,44 @@ type Context interface {
 	// ErrContextInterrupt.
 	Interrupt()
 
+	// Preempt interrupts a concurrent call to Switch().
+	// If Platform.ConcurrencyCount() == math.MaxInt, or if the context is not
+	// running application code (e.g. it is blocked waiting for the number of
+	// running contexts to drop below Platform.ConcurrencyCount(), Preempt may
+	// have no effect.
+	Preempt()
+
 	// Release() releases any resources associated with this context.
 	Release()
 
 	// PrepareSleep() is called when the thread switches to the
 	// interruptible sleep state.
 	PrepareSleep()
+
+	// PrepareUninterruptibleSleep is called when the thread switches to the
+	// uninterruptible sleep state.
+	PrepareUninterruptibleSleep()
+
+	// PrepareStop is called when the thread enters a kernel.TaskStop.
+	PrepareStop()
+
+	// PrepareExecve is called when the thread invokes execve(), immediately
+	// before switching MMs.
+	PrepareExecve()
+
+	// PrepareExit is called when the thread exits, immediately before
+	// releasing its MM.
+	PrepareExit()
+
+	// LastCPUNumber returns the last CPU number that this context was running on.
+	// If the context never ran on a CPU, it may return any valid CPU number, as long as the first
+	// call to Switch will detect that the CPU number is incorrect and return ErrContextCPUPreempted.
+	LastCPUNumber() int32
+}
+
+// LastCPUNumber implements Context.LastCPUNumber.
+func (NoCPUNumbers) LastCPUNumber() int32 {
+	panic("context does not support last CPU number")
 }
 
 // ContextError is one of the possible errors returned by Context.Switch().
@@ -429,6 +479,17 @@ func (f SegmentationFault) Error() string {
 	return fmt.Sprintf("segmentation fault at %#x", f.Addr)
 }
 
+// AddressSpaceIOUnavailable is an error returned by AddressSpaceIO methods
+// when AddressSpaceIO is unavailable for this operation due to implementation
+// limitations, such that the caller should fall back to I/O through other
+// means (rather than returning an error).
+type AddressSpaceIOUnavailable struct{}
+
+// Error implements error.Error.
+func (AddressSpaceIOUnavailable) Error() string {
+	return "platform.AddressSpaceIO currently unavailable"
+}
+
 // Requirements is used to specify platform specific requirements.
 type Requirements struct {
 	// RequiresCapSysPtrace indicates that the sandbox has to be started with
@@ -513,14 +574,34 @@ func (s StaticSeccompInfo) HottestSyscalls() []uintptr {
 	return s.HotSyscalls
 }
 
+// Options is a collection variables and flags for platform initialization.
+type Options struct {
+	// DeviceFile is the device file to use (e.g. /dev/kvm for the KVM
+	// platform).
+	DeviceFile *fd.FD
+
+	// DisableSyscallPatching controls whether Systrap is allowed to patch
+	// syscalls invocations sites at runtime.
+	DisableSyscallPatching bool
+
+	// ApplicationCores is used by KVM to determine the correct amount of
+	// vCPUs to create.
+	ApplicationCores int
+
+	// UseCPUNums is used by KVM to determine whether to use KVM CPU numbers
+	// as CPU numbers in the sentry. This is necessary to support features like
+	// rseq
+	UseCPUNums bool
+}
+
 // Constructor represents a platform type.
 type Constructor interface {
 	// New returns a new platform instance.
 	//
 	// Arguments:
 	//
-	//	* deviceFile - the device file (e.g. /dev/kvm for the KVM platform).
-	New(deviceFile *fd.FD) (Platform, error)
+	//	* opts - Platform customization bits.
+	New(opts Options) (Platform, error)
 
 	// OpenDevice opens the path to the device used by the platform.
 	// Passing in an empty string will use the default path for the device,

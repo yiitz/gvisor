@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
@@ -57,6 +56,9 @@ type machine struct {
 	// kernel is the set of global structures.
 	kernel ring0.Kernel
 
+	// applicationCores is used to calculate maxVCPUs.
+	applicationCores int
+
 	// mu protects vCPUs.
 	mu sync.RWMutex
 
@@ -86,6 +88,9 @@ type machine struct {
 
 	// usedSlots is the set of used physical addresses (not sorted).
 	usedSlots []uintptr
+
+	// useCPUNums indicates whether to enable the use vCPU numbers as CPU numbers.
+	useCPUNums bool
 }
 
 const (
@@ -213,6 +218,9 @@ type vCPU struct {
 
 	// dieState holds state related to vCPU death.
 	dieState dieState
+
+	// lastCtx is the last context that was scheduled on this vCPU
+	lastCtx atomic.Pointer[platformContext]
 }
 
 type dieState struct {
@@ -227,11 +235,11 @@ type dieState struct {
 // createVCPU creates and returns a new vCPU.
 //
 // Precondition: mu must be held.
-func (m *machine) createVCPU(id int) *vCPU {
+func (m *machine) createVCPU(id int) (*vCPU, error) {
 	// Create the vCPU.
 	fd, errno := hostsyscall.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CREATE_VCPU, uintptr(id))
 	if errno != 0 {
-		panic(fmt.Sprintf("error creating new vCPU: %v", errno))
+		return nil, fmt.Errorf("error creating new vCPU(id=%d): %w", id, errno)
 	}
 
 	c := &vCPU{
@@ -244,22 +252,22 @@ func (m *machine) createVCPU(id int) *vCPU {
 
 	// Ensure the signal mask is correct.
 	if err := c.setSignalMask(); err != nil {
-		panic(fmt.Sprintf("error setting signal mask: %v", err))
+		panic(fmt.Sprintf("error setting signal mask for vCPU(id=%d): %v", id, err))
 	}
 
 	// Map the run data.
 	runData, err := mapRunData(int(fd))
 	if err != nil {
-		panic(fmt.Sprintf("error mapping run data: %v", err))
+		panic(fmt.Sprintf("error mapping run data for vCPU(id=%d): %v", id, err))
 	}
 	c.runData = runData
 
 	// Initialize architecture state.
 	if err := c.initArchState(); err != nil {
-		panic(fmt.Sprintf("error initialization vCPU state: %v", err))
+		panic(fmt.Sprintf("error initializing vCPU(id=%d) state: %v", id, err))
 	}
 
-	return c // Done.
+	return c, nil // Done.
 }
 
 // forceMappingEntireAddressSpace forces mapping the entire process address
@@ -269,7 +277,11 @@ var forceMappingEntireAddressSpace = false
 // newMachine returns a new VM context.
 func newMachine(vm int, config *Config) (*machine, error) {
 	// Create the machine.
-	m := &machine{fd: vm}
+	m := &machine{
+		fd:               vm,
+		applicationCores: config.ApplicationCores,
+		useCPUNums:       config.UseCPUNums,
+	}
 	m.available.L = &m.mu
 
 	if err := m.applyConfig(config); err != nil {
@@ -448,10 +460,11 @@ func (m *machine) mapPhysical(physical, length uintptr) {
 		if pr == nil {
 			// Should never happen.
 			throw("mapPhysical on unknown physical address")
+			panic("unreachable") // nogo doesn't understand throw()
 		}
 
 		// Is this already mapped? Check the usedSlots.
-		if !m.hasSlot(physicalStart) {
+		if !pr.mmio && !m.hasSlot(physicalStart) {
 			m.mapMemorySlot(virtualStart, physicalStart, length, pr.readOnly)
 		}
 
@@ -618,8 +631,7 @@ func (m *machine) Put(c *vCPU) {
 // newDirtySet returns a new dirty set.
 func (m *machine) newDirtySet() *dirtySet {
 	return &dirtySet{
-		vCPUMasks: make([]atomicbitops.Uint64,
-			(m.maxVCPUs+63)/64, (m.maxVCPUs+63)/64),
+		vCPUMasks: make([]atomicbitops.Uint64, (m.maxVCPUs+63)/64),
 	}
 }
 
@@ -848,13 +860,17 @@ func seccompMmapRules(m *machine) {
 						seccomp.MaskedEqual(unix.MAP_DENYWRITE, 0),
 					},
 				}),
-				Action: linux.SECCOMP_RET_TRAP,
+				Action: seccomp.Trap,
 			},
 		}
-		instrs, _, err := seccomp.BuildProgram(rules, seccomp.ProgramOptions{
-			DefaultAction: linux.SECCOMP_RET_ALLOW,
-			BadArchAction: linux.SECCOMP_RET_ALLOW,
-		})
+		program := &seccomp.Program{
+			RuleSets: rules,
+			Options: seccomp.ProgramOptions{
+				DefaultAction: seccomp.Allow,
+				BadArchAction: seccomp.Allow,
+			},
+		}
+		instrs, _, err := program.Build()
 		if err != nil {
 			panic(fmt.Sprintf("failed to build rules: %v", err))
 		}

@@ -17,6 +17,7 @@ package boot
 import (
 	"errors"
 	"fmt"
+	"io"
 	"path"
 	"strconv"
 	"sync"
@@ -36,12 +37,15 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
+	"gvisor.dev/gvisor/pkg/sentry/state"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/state/statefile"
+	"gvisor.dev/gvisor/pkg/timing"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot/procfs"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
+	"gvisor.dev/gvisor/runsc/starttime"
 	"gvisor.dev/gvisor/runsc/version"
 )
 
@@ -61,6 +65,9 @@ const (
 
 	// ContMgrExecuteAsync executes a command in a container.
 	ContMgrExecuteAsync = "containerManager.ExecuteAsync"
+
+	// ContMgrGetSavings gets the savings for restored sandboxes.
+	ContMgrGetSavings = "containerManager.GetSavings"
 
 	// ContMgrPortForward starts port forwarding with the sandbox.
 	ContMgrPortForward = "containerManager.PortForward"
@@ -94,12 +101,11 @@ const (
 	// return its ExitStatus.
 	ContMgrWaitPID = "containerManager.WaitPID"
 
-	// ContMgrWaitCheckpoint waits for the Kernel to have been successfully
-	// checkpointed n-1 times, then waits for either the n-th successful
-	// checkpoint (in which case it returns nil) or any number of failed
-	// checkpoints (in which case it returns an error returned by any such
-	// failure).
+	// ContMgrWaitCheckpoint waits for the next Kernel checkpoint to complete.
 	ContMgrWaitCheckpoint = "containerManager.WaitCheckpoint"
+
+	// ContMgrWaitRestore waits for the Kernel restore to complete.
+	ContMgrWaitRestore = "containerManager.WaitRestore"
 
 	// ContMgrRootContainerStart starts a new sandbox with a root container.
 	ContMgrRootContainerStart = "containerManager.StartRoot"
@@ -166,6 +172,11 @@ const (
 	CgroupsWriteControlFiles = "Cgroups.WriteControlFiles"
 )
 
+// FS-related commands (see fs.go for more details).
+const (
+	FsTarRootfsUpperLayer = "Fs.TarRootfsUpperLayer"
+)
+
 // controller holds the control server, and is used for communication into the
 // sandbox.
 type controller struct {
@@ -200,6 +211,7 @@ func (c *controller) registerHandlers() {
 	l := c.manager.l
 	c.srv.Register(c.manager)
 	c.srv.Register(&control.Cgroups{Kernel: l.k})
+	c.srv.Register(&control.Fs{Kernel: l.k})
 	c.srv.Register(&control.Lifecycle{Kernel: l.k})
 	c.srv.Register(&control.Logging{})
 	c.srv.Register(&control.Proc{Kernel: l.k})
@@ -261,6 +273,12 @@ type containerManager struct {
 // StartRoot will start the root container process.
 func (cm *containerManager) StartRoot(cid *string, _ *struct{}) error {
 	log.Debugf("containerManager.StartRoot, cid: %s", *cid)
+	cm.l.mu.Lock()
+	state := cm.l.state
+	cm.l.mu.Unlock()
+	if state != created {
+		return fmt.Errorf("sandbox is not in created state, cannot start root container: state=%s", state)
+	}
 	// Tell the root container to start and wait for the result.
 	return cm.onStart()
 }
@@ -329,10 +347,14 @@ type StartArgs struct {
 	// for bind mounts in Spec.Mounts (in the same order).
 	GoferMountConfs []GoferMountConf
 
+	// IsRootfsUpperTarFilePresent indicates whether the rootfs upper tar file is present.
+	IsRootfsUpperTarFilePresent bool
+
 	// FilePayload contains, in order:
 	//   * stdin, stdout, and stderr (optional: if terminal is disabled).
 	//   * file descriptors to gofer-backing host files (optional).
 	//   * file descriptor for /dev gofer connection (optional)
+	//   * file descriptor for rootfs upper tar file (optional)
 	//   * file descriptors to connect to gofer to serve the root filesystem.
 	urpc.FilePayload
 }
@@ -353,6 +375,12 @@ func (cm *containerManager) StartSubcontainer(args *StartArgs, _ *struct{}) erro
 	if args.CID == "" {
 		return errors.New("start argument missing container ID")
 	}
+	cm.l.mu.Lock()
+	state := cm.l.state
+	cm.l.mu.Unlock()
+	if state != started {
+		return fmt.Errorf("sandbox is not in started state, cannot start subcontainer: state=%s", state)
+	}
 	expectedFDs := 1 // At least one FD for the root filesystem.
 	expectedFDs += args.NumGoferFilestoreFDs
 	if args.IsDevIoFilePresent {
@@ -360,6 +388,9 @@ func (cm *containerManager) StartSubcontainer(args *StartArgs, _ *struct{}) erro
 	}
 	if !args.Spec.Process.Terminal {
 		expectedFDs += 3
+	}
+	if args.IsRootfsUpperTarFilePresent {
+		expectedFDs++
 	}
 	if len(args.Files) < expectedFDs {
 		return fmt.Errorf("start arguments must contain at least %d FDs, but only got %d", expectedFDs, len(args.Files))
@@ -412,6 +443,17 @@ func (cm *containerManager) StartSubcontainer(args *StartArgs, _ *struct{}) erro
 		defer devGoferFD.Close()
 	}
 
+	var rootfsUpperTarFD *fd.FD
+	if args.IsRootfsUpperTarFilePresent {
+		var err error
+		rootfsUpperTarFD, err = fd.NewFromFile(goferFiles[0])
+		if err != nil {
+			return fmt.Errorf("error dup'ing rootfs upper tar file: %w", err)
+		}
+		goferFiles = goferFiles[1:]
+		defer rootfsUpperTarFD.Close()
+	}
+
 	goferFDs, err := fd.NewFromFiles(goferFiles)
 	if err != nil {
 		return fmt.Errorf("error dup'ing gofer files: %w", err)
@@ -422,7 +464,7 @@ func (cm *containerManager) StartSubcontainer(args *StartArgs, _ *struct{}) erro
 		}
 	}()
 
-	if err := cm.l.startSubcontainer(args.Spec, args.Conf, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs); err != nil {
+	if err := cm.l.startSubcontainer(args.Spec, args.Conf, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs, rootfsUpperTarFD); err != nil {
 		log.Debugf("containerManager.StartSubcontainer failed, cid: %s, args: %+v, err: %v", args.CID, args, err)
 		return err
 	}
@@ -481,7 +523,7 @@ func (cm *containerManager) PortForward(opts *PortForwardOpts, _ *struct{}) erro
 
 // RestoreOpts contains options related to restoring a container's file system.
 type RestoreOpts struct {
-	// FilePayload contains the state file to be restored, followed in order by:
+	// FilePayload contains, in order:
 	// 1. checkpoint state file.
 	// 2. optional checkpoint pages metadata file.
 	// 3. optional checkpoint pages file.
@@ -490,110 +532,113 @@ type RestoreOpts struct {
 	HavePagesFile  bool
 	HaveDeviceFile bool
 	Background     bool
+
+	RestoreOptsExtra
 }
 
 // Restore loads a container from a statefile.
 // The container's current kernel is destroyed, a restore environment is
 // created, and the kernel is recreated with the restore state file. The
 // container then sends the signal to start.
-func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
+func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) {
+	timer := starttime.Timer("Restore")
+	timer.Reached("cm.Restore RPC")
 	log.Debugf("containerManager.Restore")
 
 	cm.l.mu.Lock()
+	timer.Reached("cm.l.mu.Lock")
 	cu := cleanup.Make(cm.l.mu.Unlock)
 	defer cu.Clean()
 
-	if cm.l.state == restoring {
-		return fmt.Errorf("restore is already in progress")
+	if cm.l.state != created {
+		return fmt.Errorf("cannot restore a container in state=%s", cm.l.state)
 	}
-	if cm.l.state == started {
-		return fmt.Errorf("cannot restore a started container")
-	}
+	defer func() {
+		if retErr != nil {
+			cu.Clean() // Release `cm.l.mu` as onRestoreFailed will acquire it.
+			cm.onRestoreFailed(fmt.Errorf("Restore failed: %w", retErr))
+		}
+	}()
 	if len(o.Files) == 0 {
 		return fmt.Errorf("at least one file must be passed to Restore")
 	}
 
-	stateFile, err := o.ReleaseFD(0)
+	stateFile, pagesMetadata, pagesFile, err := getRestoreReadersImpl(o)
 	if err != nil {
 		return err
 	}
-
-	var stat unix.Stat_t
-	if err := unix.Fstat(stateFile.FD(), &stat); err != nil {
-		return err
-	}
-	if stat.Size == 0 {
-		return fmt.Errorf("statefile cannot be empty")
-	}
+	defer func() {
+		if stateFile != nil {
+			stateFile.Close()
+		}
+		if pagesMetadata != nil {
+			pagesMetadata.Close()
+		}
+		if pagesFile != nil {
+			pagesFile.Close()
+		}
+	}()
 
 	cm.restorer = &restorer{
-		restoreDone: cm.onRestoreDone,
-		stateFile:   stateFile,
-		background:  o.Background,
+		cm:         cm,
+		background: o.Background,
+		timer:      timer,
 	}
-	cm.l.restoreWaiters = sync.NewCond(&cm.l.mu)
-	cm.l.state = restoring
+
+	// Create the main MemoryFile.
+	cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP)
+	if err != nil {
+		return fmt.Errorf("creating memory file: %v", err)
+	}
+
+	if o.HavePagesFile {
+		// This immediately starts loading the main MemoryFile asynchronously.
+		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader")) // transfers ownership
+		pagesMetadata = nil
+		pagesFile = nil
+	}
+
+	cm.restorer.stateFile, cm.restorer.metadata, err = state.NewStatefileReader(stateFile /* transfers ownership on success */, nil)
+	if err != nil {
+		return fmt.Errorf("creating statefile reader: %w", err)
+	}
+	stateFile = nil
+
+	cm.l.restoreDone = sync.NewCond(&cm.l.mu)
+	cm.l.state = restoringUnstarted
+
 	// Release `cm.l.mu`.
 	cu.Clean()
 
-	fileIdx := 1
-	if o.HavePagesFile {
-		cm.restorer.pagesMetadata, err = o.ReleaseFD(fileIdx)
-		if err != nil {
-			return err
-		}
-		fileIdx++
-
-		cm.restorer.pagesFile, err = o.ReleaseFD(fileIdx)
-		if err != nil {
-			return err
-		}
-		fileIdx++
-	}
-
 	if o.HaveDeviceFile {
-		cm.restorer.deviceFile, err = o.ReleaseFD(fileIdx)
+		cm.restorer.deviceFile, err = o.ReleaseFD(len(o.Files) - 1)
 		if err != nil {
 			return err
 		}
-		fileIdx++
 	}
-
-	if fileIdx < len(o.Files) {
-		return fmt.Errorf("more files passed to Restore than expected")
-	}
+	timer.Reached("restorer ok")
 
 	// Pause the kernel while we build a new one.
 	cm.l.k.Pause()
+	timer.Reached("kernel paused")
 
-	metadata, err := statefile.MetadataUnsafe(cm.restorer.stateFile)
-	if err != nil {
-		return fmt.Errorf("reading metadata from statefile: %w", err)
-	}
-	var count int
-	countStr, ok := metadata[ContainerCountKey]
+	countStr, ok := cm.restorer.metadata[ContainerCountKey]
 	if !ok {
-		// TODO(gvisor.dev/issue/1956): Add container count with syscall save
-		// trigger. For now, assume that only a single container exists if metadata
-		// isn't present.
-		//
-		// -return errors.New("container count not present in state file")
-		count = 1
-	} else {
-		count, err = strconv.Atoi(countStr)
-		if err != nil {
-			return fmt.Errorf("invalid container count: %w", err)
-		}
-		if count < 1 {
-			return fmt.Errorf("invalid container count value: %v", count)
-		}
+		return errors.New("container count not present in state file")
+	}
+	count, err := strconv.Atoi(countStr)
+	if err != nil {
+		return fmt.Errorf("invalid container count: %w", err)
+	}
+	if count < 1 {
+		return fmt.Errorf("invalid container count value: %v", count)
 	}
 	cm.restorer.totalContainers = count
 	log.Infof("Restoring a total of %d containers", cm.restorer.totalContainers)
 
-	containerSpecs, ok := metadata[ContainerSpecsKey]
+	containerSpecs, ok := cm.restorer.metadata[ContainerSpecsKey]
 	if !ok {
-		return fmt.Errorf("container specs not found in metdata during restore")
+		return fmt.Errorf("container specs not found in metadata during restore")
 	}
 	specs, err := specutils.GetSpecsFromString(containerSpecs)
 	if err != nil {
@@ -601,37 +646,87 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 	}
 	cm.restorer.checkpointedSpecs = specs
 
-	if _, err := unix.Seek(stateFile.FD(), 0, 0); err != nil {
-		return fmt.Errorf("rewinding state file: %w", err)
-	}
-
-	checkpointVersion := metadata[VersionKey]
+	checkpointVersion := cm.restorer.metadata[VersionKey]
 	currentVersion := version.Version()
 	if checkpointVersion != currentVersion {
 		return fmt.Errorf("runsc version does not match across checkpoint restore, checkpoint: %v current: %v", checkpointVersion, currentVersion)
 	}
-	return cm.restorer.restoreContainerInfo(cm.l, &cm.l.root)
+	return cm.restorer.restoreContainerInfo(cm.l, &cm.l.root, timer.Fork("cont:root"))
 }
 
-func (cm *containerManager) onRestoreDone() error {
-	if err := cm.onStart(); err != nil {
-		return err
+func getRestoreReadersForLocalCheckpointFiles(o *RestoreOpts) (io.ReadCloser, io.ReadCloser, stateio.AsyncReader, error) {
+	stateFile, err := o.ReleaseFD(0)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	cu := cleanup.Make(func() { stateFile.Close() })
+	defer cu.Clean()
+	var stat unix.Stat_t
+	if err := unix.Fstat(stateFile.FD(), &stat); err != nil {
+		return nil, nil, nil, err
+	}
+	if stat.Size == 0 {
+		return nil, nil, nil, fmt.Errorf("statefile cannot be empty")
 	}
 
-	cm.l.restoreWaiters.Broadcast()
-	cm.restorer = nil
-	return nil
+	if !o.HavePagesFile {
+		cu.Release()
+		return stateFile, nil, nil, nil
+	}
+	pagesMetadataFile, err := o.ReleaseFD(1)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	cu.Add(func() { pagesMetadataFile.Close() })
+	pagesFile, err := o.ReleaseFD(2)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	cu.Release()
+	// //pkg/state/wire reads one byte at a time; buffer reads from
+	// pagesMetadataFile to avoid making one syscall per read. For the state
+	// file, this buffering is handled by statefile.NewReader() =>
+	// compressio.Reader or compressio.NewSimpleReader().
+	return stateFile,
+		stateio.NewBufioReadCloser(pagesMetadataFile),
+		stateio.NewPagesFileFDReaderDefault(int32(pagesFile.Release())),
+		nil
 }
 
-func (cm *containerManager) RestoreSubcontainer(args *StartArgs, _ *struct{}) error {
-	log.Debugf("containerManager.RestoreSubcontainer, cid: %s, args: %+v", args.CID, args)
-
+func (cm *containerManager) onRestoreFailed(err error) {
 	cm.l.mu.Lock()
-	if cm.l.state != restoring {
-		cm.l.mu.Unlock()
-		return fmt.Errorf("sandbox is not being restored, cannot restore subcontainer")
-	}
+	cm.l.state = restoreFailed
+	cm.l.restoreErr = err
 	cm.l.mu.Unlock()
+	cm.l.restoreDone.Broadcast()
+	cm.restorer = nil
+}
+
+func (cm *containerManager) onRestoreDone(s Savings) {
+	cm.l.mu.Lock()
+	cm.l.state = restored
+	cm.l.savings = s
+	cm.l.mu.Unlock()
+	cm.l.restoreDone.Broadcast()
+	cm.restorer = nil
+}
+
+func (cm *containerManager) RestoreSubcontainer(args *StartArgs, _ *struct{}) (retErr error) {
+	timeline := timing.OrphanTimeline(fmt.Sprintf("cont:%s", args.CID[0:min(8, len(args.CID))]), gtime.Now()).Lease()
+	defer timeline.End()
+	log.Debugf("containerManager.RestoreSubcontainer, cid: %s, args: %+v", args.CID, args)
+	cm.l.mu.Lock()
+	timeline.Reached("cm.l.mu.Lock")
+	state := cm.l.state
+	cm.l.mu.Unlock()
+	if state != restoringUnstarted {
+		return fmt.Errorf("sandbox is not being restored, cannot restore subcontainer: state=%s", state)
+	}
+	defer func() {
+		if retErr != nil {
+			cm.onRestoreFailed(fmt.Errorf("RestoreSubcontainer failed: %w", retErr))
+		}
+	}()
 
 	// Validate arguments.
 	if args.Spec == nil {
@@ -693,7 +788,8 @@ func (cm *containerManager) RestoreSubcontainer(args *StartArgs, _ *struct{}) er
 		return fmt.Errorf("error dup'ing gofer files: %w", err)
 	}
 
-	if err := cm.restorer.restoreSubcontainer(args.Spec, args.Conf, cm.l, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs); err != nil {
+	err = cm.restorer.restoreSubcontainer(args.Spec, args.Conf, cm.l, args.CID, stdios, goferFDs, goferFilestoreFDs, devGoferFD, args.GoferMountConfs, timeline.Transfer())
+	if err != nil {
 		log.Debugf("containerManager.RestoreSubcontainer failed, cid: %s, args: %+v, err: %v", args.CID, args, err)
 		return err
 	}
@@ -710,7 +806,7 @@ func (cm *containerManager) Pause(_, _ *struct{}) error {
 // Resume resumes all tasks.
 func (cm *containerManager) Resume(_, _ *struct{}) error {
 	cm.l.k.Unpause()
-	return postResumeImpl(cm.l)
+	return control.PostResume(cm.l.k, nil)
 }
 
 // Wait waits for the init process in the given container.
@@ -743,6 +839,13 @@ func (cm *containerManager) WaitCheckpoint(*struct{}, *struct{}) error {
 	log.Debugf("containerManager.WaitCheckpoint")
 	err := cm.l.k.WaitForCheckpoint()
 	log.Debugf("containerManager.WaitCheckpoint done, err = %v", err)
+	return err
+}
+
+func (cm *containerManager) WaitRestore(*struct{}, *struct{}) error {
+	log.Debugf("containerManager.WaitRestore")
+	err := cm.l.waitRestore()
+	log.Debugf("containerManager.WaitRestore done, err = %v", err)
 	return err
 }
 
@@ -957,5 +1060,22 @@ func (cm *containerManager) Mount(args *MountArgs, _ *struct{}) error {
 func (cm *containerManager) ContainerRuntimeState(cid *string, state *ContainerRuntimeState) error {
 	log.Debugf("containerManager.ContainerRuntimeState: cid: %s", *cid)
 	*state = cm.l.containerRuntimeState(*cid)
+	return nil
+}
+
+// Savings holds the savings with restore.
+type Savings struct {
+	// CPUTimeSaved is the CPU time saved at restore.
+	CPUTimeSaved gtime.Duration
+	// WallTimeSaved is the wall time saved at restore.
+	WallTimeSaved gtime.Duration
+}
+
+// GetSavings returns the savings for restored sandboxes.
+func (cm *containerManager) GetSavings(_ *struct{}, s *Savings) error {
+	log.Debugf("containerManager.GetSavings")
+	cm.l.mu.Lock()
+	*s = cm.l.savings
+	cm.l.mu.Unlock()
 	return nil
 }

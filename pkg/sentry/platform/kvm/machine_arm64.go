@@ -23,6 +23,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/ring0"
@@ -35,6 +36,11 @@ type vCPUArchState struct {
 	//
 	// This starts above fixedKernelPCID.
 	PCIDs *pagetables.PCIDs
+
+	// switchingToUser indicates whether the vCPU is in the process of
+	// switching to user mode. It is set before the SwitchToUser call
+	// and unset after.
+	switchingToUser atomicbitops.Bool
 }
 
 const (
@@ -89,7 +95,7 @@ func archPhysicalRegions(physicalRegions []physicalRegion) []physicalRegion {
 	})
 
 	var regions []physicalRegion
-	addValidRegion := func(r *physicalRegion, virtual, length uintptr, readOnly bool) {
+	addValidRegion := func(r *physicalRegion, virtual, length uintptr, mmio, readOnly bool) {
 		if length == 0 {
 			return
 		}
@@ -99,6 +105,7 @@ func archPhysicalRegions(physicalRegions []physicalRegion) []physicalRegion {
 				length:  length,
 			},
 			physical: r.physical + (virtual - r.virtual),
+			mmio:     mmio,
 			readOnly: readOnly,
 		})
 	}
@@ -119,16 +126,16 @@ func archPhysicalRegions(physicalRegions []physicalRegion) []physicalRegion {
 				if end < rdStart {
 					newEnd = end
 				}
-				addValidRegion(&pr, start, newEnd-start, false)
+				addValidRegion(&pr, start, newEnd-start, pr.mmio, false)
 				start = rdStart
 				continue
 			}
 			if rdEnd < end {
-				addValidRegion(&pr, start, rdEnd-start, true)
+				addValidRegion(&pr, start, rdEnd-start, pr.mmio, true)
 				start = rdEnd
 				continue
 			}
-			addValidRegion(&pr, start, end-start, start >= rdStart && end <= rdEnd)
+			addValidRegion(&pr, start, end-start, pr.mmio, start >= rdStart && end <= rdEnd)
 			start = end
 		}
 	}

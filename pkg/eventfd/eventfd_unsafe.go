@@ -20,6 +20,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func (ev Eventfd) mmioPtr() unsafe.Pointer {
+	return unsafe.Pointer(ev.mmioAddr)
+}
+
 // nonBlockingWrite writes the given buffer to a file descriptor. It fails if
 // partial data is written.
 func nonBlockingWrite(fd int, buf []byte) (int, error) {

@@ -17,8 +17,10 @@ package tundev
 
 import (
 	"io"
+	"time"
 
 	"golang.org/x/sys/unix"
+	"golang.org/x/time/rate"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/context"
@@ -27,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/tcpip/link/tun"
@@ -39,6 +42,8 @@ const (
 	netTunDevMinor = 200
 )
 
+var warnRateLimiter = rate.NewLimiter(rate.Every(time.Second), 1)
+
 // tunDevice implements vfs.Device for /dev/net/tun.
 //
 // +stateify savable
@@ -47,7 +52,7 @@ type tunDevice struct{}
 // Open implements vfs.Device.Open.
 func (tunDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	fd := &tunFD{}
-	if err := fd.vfsfd.Init(fd, opts.Flags, mnt, vfsd, &vfs.FileDescriptionOptions{
+	if err := fd.vfsfd.Init(fd, opts.Flags, auth.CredentialsFromContext(ctx), mnt, vfsd, &vfs.FileDescriptionOptions{
 		UseDentryMetadata: true,
 	}); err != nil {
 		return nil, err
@@ -79,7 +84,7 @@ func (fd *tunFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 
 	switch request {
 	case linux.TUNSETIFF:
-		if !t.HasCapability(linux.CAP_NET_ADMIN) {
+		if !t.NetworkNamespace().HasCapability(ctx, linux.CAP_NET_ADMIN) {
 			return 0, linuxerr.EPERM
 		}
 		stack, ok := t.NetworkContext().(*netstack.Stack)
@@ -93,11 +98,18 @@ func (fd *tunFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args 
 		}
 
 		// Validate flags.
-		flags, err := netstack.LinuxToTUNFlags(hostarch.ByteOrder.Uint16(req.Data[:]))
+		linuxFlags := hostarch.ByteOrder.Uint16(req.Data[:])
+		flags, err := netstack.LinuxToTUNFlags(linuxFlags)
 		if err != nil {
-			return 0, err
+			if warnRateLimiter.Allow() {
+				ctx.Warningf("Unsuported tun flags: %x", linuxFlags)
+			}
 		}
-		return 0, fd.device.SetIff(stack.Stack, req.Name(), flags)
+		return 0, fd.device.SetIff(ctx, stack.Stack, req.Name(), flags)
+
+	case linux.TUNSETPERSIST:
+		v := args[2].Uint()
+		return 0, fd.device.SetPersistent(v != 0)
 
 	case linux.TUNGETIFF:
 		var req linux.IFReq

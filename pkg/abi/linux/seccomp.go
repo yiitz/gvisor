@@ -14,7 +14,10 @@
 
 package linux
 
-import "fmt"
+import (
+	"fmt"
+	"structs"
+)
 
 // Seccomp constants taken from <linux/seccomp.h>.
 const (
@@ -80,7 +83,7 @@ func (a BPFAction) String() string {
 	case SECCOMP_RET_USER_NOTIF:
 		return "unotify"
 	}
-	return fmt.Sprintf("invalid action: %#x", a)
+	return fmt.Sprintf("invalid action: %#x", uint32(a))
 }
 
 // Data returns the SECCOMP_RET_DATA portion of the action.
@@ -103,6 +106,7 @@ func (a BPFAction) WithReturnCode(code uint16) BPFAction {
 
 // SockFprog is sock_fprog taken from <linux/filter.h>.
 type SockFprog struct {
+	_      structs.HostLayout
 	Len    uint16
 	pad    [6]byte
 	Filter *BPFInstruction
@@ -113,6 +117,7 @@ type SockFprog struct {
 //
 // +marshal
 type SeccompData struct {
+	_ structs.HostLayout
 	// Nr is the system call number.
 	Nr int32
 
@@ -131,6 +136,7 @@ type SeccompData struct {
 //
 // +marshal
 type SeccompNotifResp struct {
+	_     structs.HostLayout
 	ID    uint64
 	Val   int64
 	Error int32
@@ -141,6 +147,7 @@ type SeccompNotifResp struct {
 //
 // +marshal
 type SeccompNotifSizes struct {
+	_          structs.HostLayout
 	Notif      uint16
 	Notif_resp uint16
 	Data       uint16
@@ -150,6 +157,7 @@ type SeccompNotifSizes struct {
 //
 // +marshal
 type SeccompNotif struct {
+	_     structs.HostLayout
 	ID    uint64
 	Pid   int32
 	Flags uint32

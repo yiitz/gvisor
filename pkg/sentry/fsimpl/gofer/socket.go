@@ -24,8 +24,8 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-func (d *dentry) isSocket() bool {
-	return d.fileType() == linux.S_IFSOCK
+func (i *inode) isSocket() bool {
+	return i.fileType() == linux.S_IFSOCK
 }
 
 func isSocketTypeSupported(sockType linux.SockType) bool {
@@ -54,7 +54,7 @@ type endpoint struct {
 }
 
 // BidirectionalConnect implements BoundEndpoint.BidirectionalConnect.
-func (e *endpoint) BidirectionalConnect(ctx context.Context, ce transport.ConnectingEndpoint, returnConnect func(transport.Receiver, transport.ConnectedEndpoint), opts transport.UnixSocketOpts) *syserr.Error {
+func (e *endpoint) BidirectionalConnect(ctx context.Context, ce transport.ConnectingEndpoint, returnConnect func(transport.Receiver, transport.ConnectedEndpoint)) *syserr.Error {
 	// No lock ordering required as only the ConnectingEndpoint has a mutex.
 	ce.Lock()
 
@@ -68,7 +68,7 @@ func (e *endpoint) BidirectionalConnect(ctx context.Context, ce transport.Connec
 		return syserr.ErrInvalidEndpointState
 	}
 
-	c, err := e.newConnectedEndpoint(ctx, ce.Type(), ce.WaiterQueue(), opts)
+	c, err := e.newConnectedEndpoint(ctx, ce.Type(), ce.WaiterQueue())
 	if err != nil {
 		ce.Unlock()
 		return err
@@ -85,8 +85,8 @@ func (e *endpoint) BidirectionalConnect(ctx context.Context, ce transport.Connec
 
 // UnidirectionalConnect implements
 // transport.BoundEndpoint.UnidirectionalConnect.
-func (e *endpoint) UnidirectionalConnect(ctx context.Context, opts transport.UnixSocketOpts) (transport.ConnectedEndpoint, *syserr.Error) {
-	c, err := e.newConnectedEndpoint(ctx, linux.SOCK_DGRAM, &waiter.Queue{}, opts)
+func (e *endpoint) UnidirectionalConnect(ctx context.Context) (transport.ConnectedEndpoint, *syserr.Error) {
+	c, err := e.newConnectedEndpoint(ctx, linux.SOCK_DGRAM, &waiter.Queue{})
 	if err != nil {
 		return nil, err
 	}
@@ -102,15 +102,15 @@ func (e *endpoint) UnidirectionalConnect(ctx context.Context, opts transport.Uni
 	return c, nil
 }
 
-func (e *endpoint) newConnectedEndpoint(ctx context.Context, sockType linux.SockType, queue *waiter.Queue, opts transport.UnixSocketOpts) (*transport.SCMConnectedEndpoint, *syserr.Error) {
-	e.dentry.fs.renameMu.RLock()
+func (e *endpoint) newConnectedEndpoint(ctx context.Context, sockType linux.SockType, queue *waiter.Queue) (*transport.SCMConnectedEndpoint, *syserr.Error) {
+	e.dentry.inode.fs.renameMu.RLock()
 	hostSockFD, err := e.dentry.connect(ctx, sockType)
-	e.dentry.fs.renameMu.RUnlock()
+	e.dentry.inode.fs.renameMu.RUnlock()
 	if err != nil {
 		return nil, syserr.ErrConnectionRefused
 	}
 
-	c, serr := transport.NewSCMEndpoint(hostSockFD, queue, e.path, opts)
+	c, serr := transport.NewSCMEndpoint(hostSockFD, queue, e.path)
 	if serr != nil {
 		unix.Close(hostSockFD)
 		log.Warningf("NewSCMEndpoint failed: path=%q, err=%v", e.path, serr)

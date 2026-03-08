@@ -15,12 +15,11 @@
 package kernel
 
 import (
-	"fmt"
-
 	"gvisor.dev/gvisor/pkg/abi/linux/errno"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
 	"gvisor.dev/gvisor/pkg/sentry/loader"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
@@ -50,14 +49,6 @@ type TaskImage struct {
 
 	// st is the task's syscall table.
 	st *SyscallTable `state:".(syscallTableInfo)"`
-
-	// fileCaps is the image's extended attribute named security.capability.
-	fileCaps string
-}
-
-// FileCaps return the task image's security.capability extended attribute.
-func (image *TaskImage) FileCaps() string {
-	return image.fileCaps
 }
 
 // release releases all resources held by the TaskImage. release is called by
@@ -89,7 +80,7 @@ func (image *TaskImage) Fork(ctx context.Context, k *Kernel, shareAddressSpace b
 			if !newImage.MemoryManager.IncUsers() {
 				// Shouldn't be possible since image.MemoryManager should be a
 				// counted user.
-				panic(fmt.Sprintf("TaskImage.Fork called with userless TaskImage.MemoryManager"))
+				panic("TaskImage.Fork called with userless TaskImage.MemoryManager")
 			}
 		}
 		newImage.fu = image.fu
@@ -141,18 +132,23 @@ func (t *Task) Stack() *arch.Stack {
 	}
 }
 
-// LoadTaskImage loads a specified file into a new TaskImage.
+// LoadTaskImage loads a specified file into a new TaskImage. It also returns
+// the new credentials for the task after execve and a bool indicating whether
+// the task is executing with elevated privileges.
 //
 // args.MemoryManager does not need to be set by the caller.
-func (k *Kernel) LoadTaskImage(ctx context.Context, args loader.LoadArgs) (*TaskImage, *syserr.Error) {
+func (k *Kernel) LoadTaskImage(ctx context.Context, args loader.LoadArgs) (*TaskImage, *auth.Credentials, bool, *syserr.Error) {
 	// Prepare a new user address space to load into.
-	m := mm.NewMemoryManager(k, k.mf, k.SleepForAddressSpaceActivation)
+	m, merr := mm.NewMemoryManager(k, k.mf)
+	if merr != nil {
+		return nil, nil, false, syserr.FromError(merr)
+	}
 	defer m.DecUsers(ctx)
 	args.MemoryManager = m
 
-	info, err := loader.Load(ctx, args, k.extraAuxv, k.vdso)
+	info, creds, secureExec, err := loader.Load(ctx, args, k.extraAuxv, k.vdso)
 	if err != nil {
-		return nil, err
+		return nil, nil, false, err
 	}
 
 	// Lookup our new syscall table.
@@ -160,7 +156,7 @@ func (k *Kernel) LoadTaskImage(ctx context.Context, args loader.LoadArgs) (*Task
 	if !ok {
 		// No syscall table found. This means that the ELF binary does not match
 		// the architecture.
-		return nil, errNoSyscalls
+		return nil, nil, false, errNoSyscalls
 	}
 
 	if !m.IncUsers() {
@@ -172,6 +168,5 @@ func (k *Kernel) LoadTaskImage(ctx context.Context, args loader.LoadArgs) (*Task
 		MemoryManager: m,
 		fu:            k.futexes.Fork(),
 		st:            st,
-		fileCaps:      info.FileCaps,
-	}, nil
+	}, creds, secureExec, nil
 }

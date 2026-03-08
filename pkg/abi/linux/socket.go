@@ -15,6 +15,8 @@
 package linux
 
 import (
+	"structs"
+
 	"gvisor.dev/gvisor/pkg/marshal"
 )
 
@@ -174,6 +176,7 @@ const (
 //
 // +marshal
 type TpacketReq struct {
+	_           structs.HostLayout
 	TpBlockSize uint32
 	TpBlockNr   uint32
 	TpFrameSize uint32
@@ -185,6 +188,7 @@ type TpacketReq struct {
 //
 // +marshal
 type TpacketHdr struct {
+	_         structs.HostLayout
 	TpStatus  uint64
 	TpLen     uint32
 	TpSnaplen uint32
@@ -200,6 +204,7 @@ type TpacketHdr struct {
 //
 // +marshal
 type Tpacket2Hdr struct {
+	_          structs.HostLayout
 	TpStatus   uint32
 	TpLen      uint32
 	TpSnaplen  uint32
@@ -217,6 +222,7 @@ type Tpacket2Hdr struct {
 //
 // +marshal
 type TpacketStats struct {
+	_       structs.HostLayout
 	Packets uint32
 	Dropped uint32
 }
@@ -307,6 +313,29 @@ const (
 	SO_PEERGROUPS            = 59
 	SO_ZEROCOPY              = 60
 	SO_TXTIME                = 61
+	SO_BINDTOIFINDEX         = 62
+	SO_TIMESTAMP_OLD         = 29
+	SO_TIMESTAMPNS_OLD       = 35
+	SO_TIMESTAMPING_OLD      = 37
+	SO_TIMESTAMP_NEW         = 63
+	SO_TIMESTAMPNS_NEW       = 64
+	SO_TIMESTAMPING_NEW      = 65
+	SO_RCVTIMEO_NEW          = 66
+	SO_SNDTIMEO_NEW          = 67
+	SO_DETACH_REUSEPORT_BPF  = 68
+	SO_PREFER_BUSY_POLL      = 69
+	SO_BUSY_POLL_BUDGET      = 70
+	SO_NETNS_COOKIE          = 71
+	SO_BUF_LOCK              = 72
+	SO_RESERVE_MEM           = 73
+	SO_TXREHASH              = 74
+	SO_RCVMARK               = 75
+	SO_PASSPIDFD             = 76
+	SO_PEERPIDFD             = 77
+	SO_DEVMEM_LINEAR         = 78
+	SO_DEVMEM_DMABUF         = 79
+	SO_DEVMEM_DONTNEED       = 80
+	SO_RCVPRIORITY           = 82
 )
 
 // enum socket_state, from uapi/linux/net.h.
@@ -350,6 +379,7 @@ var SizeOfInetAddr = uint32((*InetAddr)(nil).SizeBytes())
 //
 // +marshal
 type SockAddrInet struct {
+	_      structs.HostLayout
 	Family uint16
 	Port   uint16
 	Addr   InetAddr
@@ -360,6 +390,7 @@ type SockAddrInet struct {
 //
 // +marshal
 type Inet6MulticastRequest struct {
+	_              structs.HostLayout
 	MulticastAddr  Inet6Addr
 	InterfaceIndex int32
 }
@@ -368,6 +399,7 @@ type Inet6MulticastRequest struct {
 //
 // +marshal
 type InetMulticastRequest struct {
+	_             structs.HostLayout
 	MulticastAddr InetAddr
 	InterfaceAddr InetAddr
 }
@@ -376,6 +408,7 @@ type InetMulticastRequest struct {
 //
 // +marshal
 type InetMulticastRequestWithNIC struct {
+	_ structs.HostLayout
 	InetMulticastRequest
 	InterfaceIndex int32
 }
@@ -389,6 +422,7 @@ type Inet6Addr [16]byte
 //
 // +marshal
 type SockAddrInet6 struct {
+	_        structs.HostLayout
 	Family   uint16
 	Port     uint16
 	Flowinfo uint32
@@ -400,6 +434,7 @@ type SockAddrInet6 struct {
 //
 // +marshal
 type SockAddrLink struct {
+	_               structs.HostLayout
 	Family          uint16
 	Protocol        uint16
 	InterfaceIndex  int32
@@ -418,6 +453,7 @@ const UnixPathMax = 108
 //
 // +marshal
 type SockAddrUnix struct {
+	_      structs.HostLayout
 	Family uint16
 	Path   [UnixPathMax]int8
 }
@@ -443,6 +479,7 @@ func (s *SockAddrNetlink) implementsSockAddr() {}
 //
 // +marshal
 type Linger struct {
+	_      structs.HostLayout
 	OnOff  int32
 	Linger int32
 }
@@ -459,6 +496,7 @@ const SizeOfLinger = 8
 //
 // +marshal
 type TCPInfo struct {
+	_ structs.HostLayout
 	// State is the state of the connection.
 	State uint8
 
@@ -617,6 +655,7 @@ const (
 //
 // +marshal
 type ControlMessageHeader struct {
+	_      structs.HostLayout
 	Length uint64
 	Level  int32
 	Type   int32
@@ -632,6 +671,7 @@ var SizeOfControlMessageHeader = (*ControlMessageHeader)(nil).SizeBytes()
 //
 // +marshal
 type ControlMessageCredentials struct {
+	_   structs.HostLayout
 	PID int32
 	UID uint32
 	GID uint32
@@ -644,6 +684,7 @@ type ControlMessageCredentials struct {
 // +marshal
 // +stateify savable
 type ControlMessageIPPacketInfo struct {
+	_               structs.HostLayout
 	NIC             int32
 	LocalAddr       InetAddr
 	DestinationAddr InetAddr
@@ -654,6 +695,7 @@ type ControlMessageIPPacketInfo struct {
 // +marshal
 // +stateify savable
 type ControlMessageIPv6PacketInfo struct {
+	_    structs.HostLayout
 	Addr Inet6Addr
 	NIC  uint32
 }
@@ -705,8 +747,14 @@ const SO_ACCEPTCON = 1 << 16
 // +marshal
 // +stateify savable
 type ICMP6Filter struct {
+	_      structs.HostLayout
 	Filter [8]uint32
 }
 
-// SizeOfICMP6Filter is the size of ICMP6Filter struct.
-var SizeOfICMP6Filter = uint32((*ICMP6Filter)(nil).SizeBytes())
+// Size of corresponding structs.
+var (
+	ICMP6FilterSize   = (*ICMP6Filter)(nil).SizeBytes()
+	SockAddrInetSize  = (*SockAddrInet)(nil).SizeBytes()
+	SockAddrInet6Size = (*SockAddrInet6)(nil).SizeBytes()
+	SockAddrLinkSize  = (*SockAddrLink)(nil).SizeBytes()
+)

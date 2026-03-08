@@ -278,6 +278,19 @@ type ThreadGroup struct {
 	// should look for a child_subreaper process at exit"
 	isChildSubreaper  bool
 	hasChildSubreaper bool
+
+	// These help serialize execve(2) with PTRACE_ATTACH and seccomp thread-sync. Since checkpointing
+	// precludes holding onto a sync.Mutex across taskRunStates, and execve(2) spans multiple
+	// taskRunStates, we implement locking by way of the ptraceExecveMutexStop internal stop.
+	// See Task.execveCredsMutexStartLock().
+	execveCredsMutexMu      sync.Mutex `state:"nosave"`
+	execveCredsMutexLocked  bool
+	execveCredsMutexWaiters map[*Task]struct{}
+
+	// sigsegvLockCount is the number of times SigsegvLock() has been called
+	// without a matching call to SigsegvUnlock(). Decrementing
+	// sigsegvLockCount to 0 requires that the signal mutex is locked.
+	sigsegvLockCount atomicbitops.Int32
 }
 
 // NewThreadGroup returns a new, empty thread group in PID namespace pidns. The
@@ -285,15 +298,17 @@ type ThreadGroup struct {
 // The new thread group isn't visible to the system until a task has been
 // created inside of it by a successful call to TaskSet.NewTask.
 func (k *Kernel) NewThreadGroup(pidns *PIDNamespace, sh *SignalHandlers, terminationSignal linux.Signal, limits *limits.LimitSet) *ThreadGroup {
+	pidns.IncRef()
 	tg := &ThreadGroup{
 		threadGroupNode: threadGroupNode{
 			pidns: pidns,
 		},
-		signalHandlers:    sh,
-		terminationSignal: terminationSignal,
-		timers:            make(map[linux.TimerID]*IntervalTimer),
-		ioUsage:           &usage.IO{},
-		limits:            limits,
+		signalHandlers:          sh,
+		terminationSignal:       terminationSignal,
+		timers:                  make(map[linux.TimerID]*IntervalTimer),
+		execveCredsMutexWaiters: make(map[*Task]struct{}),
+		ioUsage:                 &usage.IO{},
+		limits:                  limits,
 	}
 	tg.itimerRealTimer = ktime.NewSampledTimer(k.timekeeper.monotonicClock, &tg.itimerRealListener)
 	tg.itimerRealListener.tg = tg
@@ -364,6 +379,7 @@ func (tg *ThreadGroup) Release(ctx context.Context) {
 	for _, it := range its {
 		it.DestroyTimer()
 	}
+	tg.pidns.DecRef(ctx)
 }
 
 // forEachChildThreadGroupLocked indicates over all child ThreadGroups.
@@ -429,7 +445,7 @@ func (tg *ThreadGroup) SetControllingTTY(ctx context.Context, tty *TTY, steal bo
 	}
 
 	creds := auth.CredentialsFromContext(ctx)
-	hasAdmin := creds.HasCapabilityIn(linux.CAP_SYS_ADMIN, creds.UserNamespace.Root())
+	hasAdmin := creds.HasRootCapability(linux.CAP_SYS_ADMIN)
 
 	// "If this terminal is already the controlling terminal of a different
 	// session group, then the ioctl fails with EPERM, unless the caller
@@ -662,4 +678,39 @@ func (tg *ThreadGroup) Execed() bool {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
 	return tg.execed
+}
+
+// SigsegvLock causes page faults that would result in SIGSEGV being sent to
+// tasks in tg to block without sending SIGSEGV. When SigsegvUnlock has been
+// called an equal number of times as SigsegvLock, application execution is
+// restarted, allowing the page fault to send SIGSEGV if it recurs.
+func (tg *ThreadGroup) SigsegvLock() {
+	tg.sigsegvLockCount.Add(1)
+}
+
+// SigsegvUnlock ends the effect of one preceding call to SigsegvLock.
+func (tg *ThreadGroup) SigsegvUnlock() {
+	sh := tg.signalLock()
+	defer sh.mu.Unlock()
+	if count := tg.sigsegvLockCount.Add(-1); count == 0 {
+		for t := tg.tasks.Front(); t != nil; t = t.Next() {
+			if _, ok := t.stop.(*sigsegvLockStop); ok {
+				t.Infof("Resuming execution due to SigsegvUnlock")
+				t.endInternalStopLocked()
+			}
+		}
+	} else if count < 0 {
+		panic("unlock of unlocked ThreadGroup.SigsegvLock")
+	}
+}
+
+// sigsegvLockStop is a TaskStop entered when a task would raise SIGSEGV due to
+// an unhandled page fault, but ThreadGroup.SigsegvLock() is in effect.
+//
+// +stateify savable
+type sigsegvLockStop struct{}
+
+// Killable implements TaskStop.Killable.
+func (*sigsegvLockStop) Killable() bool {
+	return true
 }

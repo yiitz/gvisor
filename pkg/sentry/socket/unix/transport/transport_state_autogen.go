@@ -18,6 +18,7 @@ func (e *connectionedEndpoint) StateFields() []string {
 		"id",
 		"idGenerator",
 		"stype",
+		"peerCreds",
 		"acceptedChan",
 		"boundSocketFD",
 	}
@@ -26,14 +27,15 @@ func (e *connectionedEndpoint) StateFields() []string {
 // +checklocksignore
 func (e *connectionedEndpoint) StateSave(stateSinkObject state.Sink) {
 	e.beforeSave()
-	var acceptedChanValue []*connectionedEndpoint
-	acceptedChanValue = e.saveAcceptedChan()
-	stateSinkObject.SaveValue(4, acceptedChanValue)
+	acceptedChanValue := e.saveAcceptedChan()
+	_ = ([]*connectionedEndpoint)(acceptedChanValue)
+	stateSinkObject.SaveValue(5, acceptedChanValue)
 	stateSinkObject.Save(0, &e.baseEndpoint)
 	stateSinkObject.Save(1, &e.id)
 	stateSinkObject.Save(2, &e.idGenerator)
 	stateSinkObject.Save(3, &e.stype)
-	stateSinkObject.Save(5, &e.boundSocketFD)
+	stateSinkObject.Save(4, &e.peerCreds)
+	stateSinkObject.Save(6, &e.boundSocketFD)
 }
 
 // +checklocksignore
@@ -42,8 +44,9 @@ func (e *connectionedEndpoint) StateLoad(ctx context.Context, stateSourceObject 
 	stateSourceObject.Load(1, &e.id)
 	stateSourceObject.Load(2, &e.idGenerator)
 	stateSourceObject.Load(3, &e.stype)
-	stateSourceObject.Load(5, &e.boundSocketFD)
-	stateSourceObject.LoadValue(4, new([]*connectionedEndpoint), func(y any) { e.loadAcceptedChan(ctx, y.([]*connectionedEndpoint)) })
+	stateSourceObject.Load(4, &e.peerCreds)
+	stateSourceObject.Load(6, &e.boundSocketFD)
+	stateSourceObject.LoadValue(5, new([]*connectionedEndpoint), func(y any) { e.loadAcceptedChan(ctx, y.([]*connectionedEndpoint)) })
 	stateSourceObject.AfterLoad(func() { e.afterLoad(ctx) })
 }
 
@@ -54,6 +57,8 @@ func (e *connectionlessEndpoint) StateTypeName() string {
 func (e *connectionlessEndpoint) StateFields() []string {
 	return []string{
 		"baseEndpoint",
+		"closerStack",
+		"closerStackLen",
 	}
 }
 
@@ -63,11 +68,15 @@ func (e *connectionlessEndpoint) beforeSave() {}
 func (e *connectionlessEndpoint) StateSave(stateSinkObject state.Sink) {
 	e.beforeSave()
 	stateSinkObject.Save(0, &e.baseEndpoint)
+	stateSinkObject.Save(1, &e.closerStack)
+	stateSinkObject.Save(2, &e.closerStackLen)
 }
 
 // +checklocksignore
 func (e *connectionlessEndpoint) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &e.baseEndpoint)
+	stateSourceObject.Load(1, &e.closerStack)
+	stateSourceObject.Load(2, &e.closerStackLen)
 	stateSourceObject.AfterLoad(func() { e.afterLoad(ctx) })
 }
 
@@ -118,7 +127,6 @@ func (e *SCMConnectedEndpoint) StateFields() []string {
 	return []string{
 		"HostConnectedEndpoint",
 		"queue",
-		"opts",
 	}
 }
 
@@ -127,7 +135,6 @@ func (e *SCMConnectedEndpoint) StateSave(stateSinkObject state.Sink) {
 	e.beforeSave()
 	stateSinkObject.Save(0, &e.HostConnectedEndpoint)
 	stateSinkObject.Save(1, &e.queue)
-	stateSinkObject.Save(2, &e.opts)
 }
 
 func (e *SCMConnectedEndpoint) afterLoad(context.Context) {}
@@ -136,7 +143,6 @@ func (e *SCMConnectedEndpoint) afterLoad(context.Context) {}
 func (e *SCMConnectedEndpoint) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &e.HostConnectedEndpoint)
 	stateSourceObject.Load(1, &e.queue)
-	stateSourceObject.Load(2, &e.opts)
 }
 
 func (r *HostConnectedEndpointRefs) StateTypeName() string {
@@ -317,31 +323,6 @@ func (c *ControlMessages) StateLoad(ctx context.Context, stateSourceObject state
 	stateSourceObject.Load(1, &c.Credentials)
 }
 
-func (u *UnixSocketOpts) StateTypeName() string {
-	return "pkg/sentry/socket/unix/transport.UnixSocketOpts"
-}
-
-func (u *UnixSocketOpts) StateFields() []string {
-	return []string{
-		"DisconnectOnSave",
-	}
-}
-
-func (u *UnixSocketOpts) beforeSave() {}
-
-// +checklocksignore
-func (u *UnixSocketOpts) StateSave(stateSinkObject state.Sink) {
-	u.beforeSave()
-	stateSinkObject.Save(0, &u.DisconnectOnSave)
-}
-
-func (u *UnixSocketOpts) afterLoad(context.Context) {}
-
-// +checklocksignore
-func (u *UnixSocketOpts) StateLoad(ctx context.Context, stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &u.DisconnectOnSave)
-}
-
 func (m *message) StateTypeName() string {
 	return "pkg/sentry/socket/unix/transport.message"
 }
@@ -500,6 +481,7 @@ func (e *baseEndpoint) StateFields() []string {
 		"connected",
 		"path",
 		"ops",
+		"lastError",
 	}
 }
 
@@ -514,6 +496,7 @@ func (e *baseEndpoint) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(3, &e.connected)
 	stateSinkObject.Save(4, &e.path)
 	stateSinkObject.Save(5, &e.ops)
+	stateSinkObject.Save(6, &e.lastError)
 }
 
 func (e *baseEndpoint) afterLoad(context.Context) {}
@@ -526,6 +509,7 @@ func (e *baseEndpoint) StateLoad(ctx context.Context, stateSourceObject state.So
 	stateSourceObject.Load(3, &e.connected)
 	stateSourceObject.Load(4, &e.path)
 	stateSourceObject.Load(5, &e.ops)
+	stateSourceObject.Load(6, &e.lastError)
 }
 
 func init() {
@@ -539,7 +523,6 @@ func init() {
 	state.Register((*messageList)(nil))
 	state.Register((*messageEntry)(nil))
 	state.Register((*ControlMessages)(nil))
-	state.Register((*UnixSocketOpts)(nil))
 	state.Register((*message)(nil))
 	state.Register((*Address)(nil))
 	state.Register((*queueReceiver)(nil))

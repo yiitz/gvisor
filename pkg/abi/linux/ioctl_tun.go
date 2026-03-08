@@ -16,8 +16,9 @@ package linux
 
 // ioctl(2) request numbers from linux/if_tun.h
 var (
-	TUNSETIFF = IOW('T', 202, 4)
-	TUNGETIFF = IOR('T', 210, 4)
+	TUNSETIFF     = IOW('T', 202, 4)
+	TUNSETPERSIST = IOW('T', 203, 4)
+	TUNGETIFF     = IOR('T', 210, 4)
 )
 
 // Flags from net/if_tun.h
@@ -26,7 +27,7 @@ const (
 	IFF_TAP      = 0x0002
 	IFF_NO_PI    = 0x1000
 	IFF_NOFILTER = 0x1000
-
+	IFF_TUN_EXCL = 0x8000
 	// According to linux/if_tun.h "This flag has no real effect"
 	IFF_ONE_QUEUE = 0x2000
 )

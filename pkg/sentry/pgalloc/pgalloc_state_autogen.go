@@ -8,6 +8,62 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
+func (l *asyncMemoryFileLoadList) StateTypeName() string {
+	return "pkg/sentry/pgalloc.asyncMemoryFileLoadList"
+}
+
+func (l *asyncMemoryFileLoadList) StateFields() []string {
+	return []string{
+		"head",
+		"tail",
+	}
+}
+
+func (l *asyncMemoryFileLoadList) beforeSave() {}
+
+// +checklocksignore
+func (l *asyncMemoryFileLoadList) StateSave(stateSinkObject state.Sink) {
+	l.beforeSave()
+	stateSinkObject.Save(0, &l.head)
+	stateSinkObject.Save(1, &l.tail)
+}
+
+func (l *asyncMemoryFileLoadList) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (l *asyncMemoryFileLoadList) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &l.head)
+	stateSourceObject.Load(1, &l.tail)
+}
+
+func (e *asyncMemoryFileLoadEntry) StateTypeName() string {
+	return "pkg/sentry/pgalloc.asyncMemoryFileLoadEntry"
+}
+
+func (e *asyncMemoryFileLoadEntry) StateFields() []string {
+	return []string{
+		"next",
+		"prev",
+	}
+}
+
+func (e *asyncMemoryFileLoadEntry) beforeSave() {}
+
+// +checklocksignore
+func (e *asyncMemoryFileLoadEntry) StateSave(stateSinkObject state.Sink) {
+	e.beforeSave()
+	stateSinkObject.Save(0, &e.next)
+	stateSinkObject.Save(1, &e.prev)
+}
+
+func (e *asyncMemoryFileLoadEntry) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (e *asyncMemoryFileLoadEntry) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &e.next)
+	stateSourceObject.Load(1, &e.prev)
+}
+
 func (s *aplUnloadedSet) StateTypeName() string {
 	return "pkg/sentry/pgalloc.aplUnloadedSet"
 }
@@ -23,8 +79,8 @@ func (s *aplUnloadedSet) beforeSave() {}
 // +checklocksignore
 func (s *aplUnloadedSet) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
-	var rootValue []aplUnloadedFlatSegment
-	rootValue = s.saveRoot()
+	rootValue := s.saveRoot()
+	_ = ([]aplUnloadedFlatSegment)(rootValue)
 	stateSinkObject.SaveValue(0, rootValue)
 }
 
@@ -155,8 +211,8 @@ func (s *evictableRangeSet) beforeSave() {}
 // +checklocksignore
 func (s *evictableRangeSet) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
-	var rootValue []evictableRangeFlatSegment
-	rootValue = s.saveRoot()
+	rootValue := s.saveRoot()
+	_ = ([]evictableRangeFlatSegment)(rootValue)
 	stateSinkObject.SaveValue(0, rootValue)
 }
 
@@ -259,8 +315,8 @@ func (s *memAcctSet) beforeSave() {}
 // +checklocksignore
 func (s *memAcctSet) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
-	var rootValue []memAcctFlatSegment
-	rootValue = s.saveRoot()
+	rootValue := s.saveRoot()
+	_ = ([]memAcctFlatSegment)(rootValue)
 	stateSinkObject.SaveValue(0, rootValue)
 }
 
@@ -456,6 +512,49 @@ func (m *memAcctInfo) StateLoad(ctx context.Context, stateSourceObject state.Sou
 	stateSourceObject.Load(4, &m.commitSeq)
 }
 
+func (m *memoryFileSaved) StateTypeName() string {
+	return "pkg/sentry/pgalloc.memoryFileSaved"
+}
+
+func (m *memoryFileSaved) StateFields() []string {
+	return []string{
+		"unwasteSmall",
+		"unwasteHuge",
+		"unfreeSmall",
+		"unfreeHuge",
+		"subreleased",
+		"memAcct",
+		"chunks",
+	}
+}
+
+func (m *memoryFileSaved) beforeSave() {}
+
+// +checklocksignore
+func (m *memoryFileSaved) StateSave(stateSinkObject state.Sink) {
+	m.beforeSave()
+	stateSinkObject.Save(0, &m.unwasteSmall)
+	stateSinkObject.Save(1, &m.unwasteHuge)
+	stateSinkObject.Save(2, &m.unfreeSmall)
+	stateSinkObject.Save(3, &m.unfreeHuge)
+	stateSinkObject.Save(4, &m.subreleased)
+	stateSinkObject.Save(5, &m.memAcct)
+	stateSinkObject.Save(6, &m.chunks)
+}
+
+func (m *memoryFileSaved) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (m *memoryFileSaved) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &m.unwasteSmall)
+	stateSourceObject.Load(1, &m.unwasteHuge)
+	stateSourceObject.Load(2, &m.unfreeSmall)
+	stateSourceObject.Load(3, &m.unfreeHuge)
+	stateSourceObject.Load(4, &m.subreleased)
+	stateSourceObject.Load(5, &m.memAcct)
+	stateSourceObject.Load(6, &m.chunks)
+}
+
 func (s *unfreeSet) StateTypeName() string {
 	return "pkg/sentry/pgalloc.unfreeSet"
 }
@@ -471,8 +570,8 @@ func (s *unfreeSet) beforeSave() {}
 // +checklocksignore
 func (s *unfreeSet) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
-	var rootValue []unfreeFlatSegment
-	rootValue = s.saveRoot()
+	rootValue := s.saveRoot()
+	_ = ([]unfreeFlatSegment)(rootValue)
 	stateSinkObject.SaveValue(0, rootValue)
 }
 
@@ -575,8 +674,8 @@ func (s *unwasteSet) beforeSave() {}
 // +checklocksignore
 func (s *unwasteSet) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
-	var rootValue []unwasteFlatSegment
-	rootValue = s.saveRoot()
+	rootValue := s.saveRoot()
+	_ = ([]unwasteFlatSegment)(rootValue)
 	stateSinkObject.SaveValue(0, rootValue)
 }
 
@@ -665,6 +764,8 @@ func (u *unwasteFlatSegment) StateLoad(ctx context.Context, stateSourceObject st
 }
 
 func init() {
+	state.Register((*asyncMemoryFileLoadList)(nil))
+	state.Register((*asyncMemoryFileLoadEntry)(nil))
 	state.Register((*aplUnloadedSet)(nil))
 	state.Register((*aplUnloadednode)(nil))
 	state.Register((*aplUnloadedFlatSegment)(nil))
@@ -679,6 +780,7 @@ func init() {
 	state.Register((*unwasteInfo)(nil))
 	state.Register((*unfreeInfo)(nil))
 	state.Register((*memAcctInfo)(nil))
+	state.Register((*memoryFileSaved)(nil))
 	state.Register((*unfreeSet)(nil))
 	state.Register((*unfreenode)(nil))
 	state.Register((*unfreeFlatSegment)(nil))

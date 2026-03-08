@@ -135,6 +135,11 @@ func (t *Task) endInternalStopLocked() {
 	}
 	t.Debugf("Leaving internal stop %#v", t.stop)
 	t.stop = nil
+	// t.canReceiveSignalLocked() skips stopped tasks, so we may need to handle
+	// signals that were sent while we were stopped.
+	if (t.pendingSignals.pendingSet.RacyLoad()|t.tg.pendingSignals.pendingSet.RacyLoad())&^t.signalMask.RacyLoad() != 0 {
+		t.interrupt()
+	}
 	t.endStopLocked()
 }
 
@@ -201,6 +206,8 @@ func (ts *TaskSet) BeginExternalStop() {
 }
 
 // PullFullState receives full states for all tasks.
+//
+// Precondition: The kernel must be paused.
 func (ts *TaskSet) PullFullState() {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
@@ -208,11 +215,9 @@ func (ts *TaskSet) PullFullState() {
 		return
 	}
 	for t := range ts.Root.tids {
-		t.Activate()
 		if mm := t.MemoryManager(); mm != nil {
 			t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch())
 		}
-		t.Deactivate()
 	}
 }
 

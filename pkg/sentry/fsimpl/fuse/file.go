@@ -91,7 +91,7 @@ func (fd *fileDescription) Release(ctx context.Context) {
 	// Ignoring errors and FUSE server replies is analogous to Linux's behavior.
 	req := conn.NewRequest(auth.CredentialsFromContext(ctx), pidFromContext(ctx), inode.nodeID, opcode, &in)
 	// The reply will be ignored since no callback is defined in asyncCallBack().
-	conn.CallAsync(ctx, req)
+	conn.Call(ctx, req)
 }
 
 // OnClose implements vfs.FileDescriptionImpl.OnClose.
@@ -101,12 +101,23 @@ func (fd *fileDescription) OnClose(ctx context.Context) error {
 	inode.attrMu.Lock()
 	defer inode.attrMu.Unlock()
 
+	if conn.noOpen {
+		return nil
+	}
+	if fd.OpenFlag&linux.FOPEN_NOFLUSH != 0 {
+		return nil
+	}
+
 	in := linux.FUSEFlushIn{
 		Fh:        fd.Fh,
 		LockOwner: 0, // TODO(gvisor.dev/issue/3245): file lock
 	}
 	req := conn.NewRequest(auth.CredentialsFromContext(ctx), pidFromContext(ctx), inode.nodeID, linux.FUSE_FLUSH, &in)
-	return conn.CallAsync(ctx, req)
+	res, err := conn.Call(ctx, req)
+	if err != nil {
+		return err
+	}
+	return res.Error()
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.

@@ -36,6 +36,7 @@ package overlay
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"sync/atomic"
 
@@ -99,6 +100,10 @@ type filesystem struct {
 	// used for accesses to the filesystem's layers. creds is immutable.
 	creds *auth.Credentials
 
+	// createCreds is a cache of credentials that is used for create operations.
+	createCredsMu createCredsMutex `state:"nosave"`
+	createCreds   map[createCredsKey]*auth.Credentials
+
 	// dirDevMinor is the device minor number used for directories. dirDevMinor
 	// is immutable.
 	dirDevMinor uint32
@@ -146,6 +151,12 @@ type layerDevNumber struct {
 type layerDevNoAndIno struct {
 	layerDevNumber
 	ino uint64
+}
+
+// +stateify savable
+type createCredsKey struct {
+	uid auth.KUID
+	gid auth.KGID
 }
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
@@ -494,6 +505,16 @@ func (fs *filesystem) getLowerDevMinor(layerMajor, layerMinor uint32) (uint32, e
 	return minor, nil
 }
 
+// TarUpperLayer implements vfs.TarSerializer.TarUpperLayer.
+func (fs *filesystem) TarUpperLayer(ctx context.Context, outFD *os.File) error {
+	upperFS := fs.opts.UpperRoot.Mount().Filesystem()
+	ts, ok := upperFS.Impl().(vfs.TarSerializer)
+	if !ok {
+		return fmt.Errorf("upper layer is of type %q, which does not implement vfs.TarSerializer", upperFS.FilesystemType().Name())
+	}
+	return ts.TarUpperLayer(ctx, outFD)
+}
+
 // dentry implements vfs.DentryImpl.
 //
 // +stateify savable
@@ -690,7 +711,6 @@ func (d *dentry) checkDropLocked(ctx context.Context) {
 
 	// Refs is still zero; destroy it.
 	d.destroyLocked(ctx)
-	return
 }
 
 // destroyLocked destroys the dentry.
@@ -839,11 +859,9 @@ const statInternalMask = linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_UID |
 func (d *dentry) statInternalTo(ctx context.Context, opts *vfs.StatOptions, stat *linux.Statx) {
 	stat.Mask |= statInternalMask
 	if d.isDir() {
-		// Linux sets nlink to 1 for merged directories
-		// (fs/overlayfs/inode.c:ovl_getattr()); we set it to 2 because this is
-		// correct more often ("." and the directory's entry in its parent),
-		// and some of our tests expect this.
-		stat.Nlink = 2
+		// This is consistent with Linux overlayfs for merged directories
+		// (fs/overlayfs/inode.c:ovl_getattr()).
+		stat.Nlink = 1
 	}
 	stat.UID = d.uid.Load()
 	stat.GID = d.gid.Load()
@@ -876,25 +894,35 @@ func (d *dentry) mayDelete(creds *auth.Credentials, child *dentry) error {
 	)
 }
 
-// newChildOwnerStat returns a Statx for configuring the UID, GID, and mode of
-// children.
-func (d *dentry) newChildOwnerStat(mode linux.FileMode, creds *auth.Credentials) linux.Statx {
-	stat := linux.Statx{
-		Mask: uint32(linux.STATX_UID | linux.STATX_GID),
-		UID:  uint32(creds.EffectiveKUID),
-		GID:  uint32(creds.EffectiveKGID),
+// credsForCreate returns the creds to use for creation operations.
+func (d *dentry) credsForCreate(creds *auth.Credentials, isSGIDSet bool) *auth.Credentials {
+	// During creation operations, Linux uses a modified version of fs.creds. It
+	// sets the fsuid/fsgid to the caller's fsuid/fsgid. Note that gVisor doesn't
+	// support fsuid/fsgid and just uses euid/egid to determine file ownership
+	// for new files. So we just update euid/egid with the caller's euid/egid.
+	key := createCredsKey{
+		uid: creds.EffectiveKUID,
+		gid: creds.EffectiveKGID,
 	}
-	// Set GID and possibly the SGID bit if the parent is an SGID directory.
-	d.copyMu.RLock()
-	defer d.copyMu.RUnlock()
-	if d.mode.Load()&linux.ModeSetGID == linux.ModeSetGID {
-		stat.GID = d.gid.Load()
-		if stat.Mode&linux.ModeDirectory == linux.ModeDirectory {
-			stat.Mode = uint16(mode) | linux.ModeSetGID
-			stat.Mask |= linux.STATX_MODE
+	if isSGIDSet {
+		key.gid = auth.KGID(d.gid.Load())
+	}
+	if d.fs.creds.EffectiveKUID == key.uid && d.fs.creds.EffectiveKGID == key.gid {
+		return d.fs.creds
+	}
+	d.fs.createCredsMu.Lock()
+	defer d.fs.createCredsMu.Unlock()
+	newCreds, ok := d.fs.createCreds[key]
+	if !ok {
+		newCreds = d.fs.creds.Fork()
+		newCreds.EffectiveKUID = key.uid
+		newCreds.EffectiveKGID = key.gid
+		if d.fs.createCreds == nil {
+			d.fs.createCreds = make(map[createCredsKey]*auth.Credentials)
 		}
+		d.fs.createCreds[key] = newCreds
 	}
-	return stat
+	return newCreds
 }
 
 // fileDescription is embedded by overlay implementations of

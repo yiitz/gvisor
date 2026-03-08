@@ -15,6 +15,8 @@
 package linux
 
 import (
+	"structs"
+
 	"gvisor.dev/gvisor/pkg/bits"
 	"gvisor.dev/gvisor/pkg/hostarch"
 )
@@ -130,12 +132,12 @@ func MakeSignalSet(sigs ...Signal) SignalSet {
 	for i, sig := range sigs {
 		indices[i] = sig.Index()
 	}
-	return SignalSet(bits.Mask64(indices...))
+	return bits.Mask[SignalSet](indices...)
 }
 
 // SignalSetOf returns a SignalSet with a single signal set.
 func SignalSetOf(sig Signal) SignalSet {
-	return SignalSet(bits.MaskOf64(sig.Index()))
+	return bits.MaskOf[SignalSet](sig.Index())
 }
 
 // ForEachSignal invokes f for each signal set in the given mask.
@@ -279,10 +281,19 @@ const (
 	SIGEV_THREAD_ID = 4
 )
 
+// SIGTRAP si_codes
+const (
+	TRAP_BRKPT  = 1
+	TRAP_TRACE  = 2
+	TRAP_BRANCH = 3
+	TRAP_HWBKPT = 4
+)
+
 // Sigevent represents struct sigevent.
 //
 // +marshal
 type Sigevent struct {
+	_      structs.HostLayout
 	Value  uint64 // union sigval {int, void*}
 	Signo  int32
 	Notify int32
@@ -298,6 +309,7 @@ type Sigevent struct {
 // +marshal
 // +stateify savable
 type SigAction struct {
+	_        structs.HostLayout
 	Handler  uint64
 	Flags    uint64
 	Restorer uint64
@@ -310,6 +322,7 @@ type SigAction struct {
 // +marshal
 // +stateify savable
 type SignalStack struct {
+	_     structs.HostLayout
 	Addr  uint64
 	Flags uint32
 	_     uint32
@@ -337,6 +350,7 @@ func (s *SignalStack) IsEnabled() bool {
 // +marshal
 // +stateify savable
 type SignalInfo struct {
+	_     structs.HostLayout
 	Signo int32 // Signal number
 	Errno int32 // Errno value
 	Code  int32 // Signal code

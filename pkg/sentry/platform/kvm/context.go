@@ -16,6 +16,7 @@ package kvm
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/ring0"
@@ -36,6 +37,9 @@ type platformContext struct {
 
 	// interrupt is the interrupt platformContext.
 	interrupt interrupt.Forwarder
+
+	// lastUsedCPU is the last CPU ID used by this platformContext.
+	lastUsedCPU atomicbitops.Int32
 }
 
 // tryCPUIDError indicates that CPUID emulation should occur.
@@ -45,7 +49,7 @@ type tryCPUIDError struct{}
 func (tryCPUIDError) Error() string { return "cpuid emulation failed" }
 
 // Switch runs the provided platformContext in the given address space.
-func (c *platformContext) Switch(ctx pkgcontext.Context, mm platform.MemoryManager, ac *arch.Context64, _ int32) (*linux.SignalInfo, hostarch.AccessType, error) {
+func (c *platformContext) Switch(ctx pkgcontext.Context, mm platform.MemoryManager, ac *arch.Context64, rseqCPU int32) (*linux.SignalInfo, hostarch.AccessType, error) {
 	as := mm.AddressSpace()
 	localAS := as.(*addressSpace)
 
@@ -57,6 +61,19 @@ restart:
 	if !c.interrupt.Enable(cpu) {
 		c.machine.Put(cpu) // Already preempted.
 		return nil, hostarch.NoAccess, platform.ErrContextInterrupt
+	}
+	// If this CPU was last used to run a different context
+	// or if this context last ran on a different CPU, then we've
+	// been preempted.
+	last := cpu.lastCtx.Swap(c)
+	c.lastUsedCPU.Store(int32(cpu.id))
+	if rseqCPU >= 0 && (last != c || rseqCPU != int32(cpu.id)) {
+		// Release resources.
+		c.machine.Put(cpu)
+
+		// All done.
+		c.interrupt.Disable()
+		return nil, hostarch.NoAccess, platform.ErrContextCPUPreempted
 	}
 
 	// Set the active address space.
@@ -93,22 +110,20 @@ restart:
 	// All done.
 	c.interrupt.Disable()
 
-	if err != nil {
-		if _, ok := err.(tryCPUIDError); ok {
-			// Does emulation work for the CPUID?
-			//
-			// We have to put the current vCPU, because
-			// TryCPUIDEmulate needs to read a user memory and it
-			// has to lock mm.activeMu for that, but it can race
-			// with as.invalidate that bonce all vcpu-s to gr0 and
-			// is called under mm.activeMu too.
-			if platform.TryCPUIDEmulate(ctx, mm, ac) {
-				goto restart
-			}
-			// If not a valid CPUID, then the signal should be
-			// delivered as is and the information is filled.
-			err = platform.ErrContextSignal
+	if _, ok := err.(tryCPUIDError); ok {
+		// Does emulation work for the CPUID?
+		//
+		// We have to put the current vCPU, because
+		// TryCPUIDEmulate needs to read a user memory and it
+		// has to lock mm.activeMu for that, but it can race
+		// with as.invalidate that bonce all vcpu-s to gr0 and
+		// is called under mm.activeMu too.
+		if platform.TryCPUIDEmulate(ctx, mm, ac) {
+			goto restart
 		}
+		// If not a valid CPUID, then the signal should be
+		// delivered as is and the information is filled.
+		err = platform.ErrContextSignal
 	}
 	return &c.info, at, err
 }
@@ -116,6 +131,11 @@ restart:
 // Interrupt interrupts the running context.
 func (c *platformContext) Interrupt() {
 	c.interrupt.NotifyInterrupt()
+}
+
+// Preempt implements platform.Context.Preempt.
+func (c *platformContext) Preempt() {
+	c.interrupt.Preempt()
 }
 
 // Release implements platform.Context.Release().
@@ -129,5 +149,23 @@ func (c *platformContext) PullFullState(as platform.AddressSpace, ac *arch.Conte
 	return nil
 }
 
-// PrepareSleep implements platform.Context.platform.Context.
+// PrepareSleep implements platform.Context.PrepareSleep.
 func (*platformContext) PrepareSleep() {}
+
+// PrepareUninterruptibleSleep implements
+// platform.Context.PrepareUninterruptibleSleep.
+func (*platformContext) PrepareUninterruptibleSleep() {}
+
+// PrepareStop implements platform.Context.PrepareStop.
+func (*platformContext) PrepareStop() {}
+
+// PrepareExecve implements platform.Context.PrepareExecve.
+func (*platformContext) PrepareExecve() {}
+
+// PrepareExit implements platform.Context.PrepareExit.
+func (*platformContext) PrepareExit() {}
+
+// LastCPUNumber implements platform.Context.LastCPUNumber.
+func (c *platformContext) LastCPUNumber() int32 {
+	return c.lastUsedCPU.Load()
+}

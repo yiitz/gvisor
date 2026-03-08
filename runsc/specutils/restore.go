@@ -17,7 +17,7 @@ package specutils
 import (
 	"encoding/json"
 	"fmt"
-	"path"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"sort"
@@ -99,6 +99,11 @@ func validateMounts(field, cName string, o, n []specs.Mount) error {
 }
 
 func validateDevices(field, cName string, o, n []specs.LinuxDevice) error {
+	var err error
+	o, n, err = prevalidateDevicesImpl(field, cName, o, n)
+	if err != nil {
+		return err
+	}
 	if len(o) != len(n) {
 		return validateErrorWithMsg(field, cName, o, n, "length mismatch")
 	}
@@ -136,14 +141,15 @@ func validateDevices(field, cName string, o, n []specs.LinuxDevice) error {
 
 func extractAnnotationsToValidate(o map[string]string) map[string]string {
 	const (
-		gvisorPrefix   = "dev.gvisor."
-		internalPrefix = "dev.gvisor.internal."
-		mntPrefix      = "dev.gvisor.spec.mount."
+		gvisorPrefix             = "dev.gvisor."
+		internalPrefix           = "dev.gvisor.internal."
+		mntPrefix                = "dev.gvisor.spec.mount."
+		containerNameRemapPrefix = "dev.gvisor.container-name-remap."
 	)
 
 	n := make(map[string]string)
 	for key, val := range o {
-		if strings.HasPrefix(key, internalPrefix) || (strings.HasPrefix(key, mntPrefix) && strings.HasSuffix(key, ".source")) {
+		if strings.HasPrefix(key, internalPrefix) || strings.HasPrefix(key, containerNameRemapPrefix) || (strings.HasPrefix(key, mntPrefix) && strings.HasSuffix(key, ".source")) {
 			continue
 		}
 
@@ -209,14 +215,6 @@ func validateMap[K comparable, V comparable](field, cName string, oldM map[K]V, 
 	return nil
 }
 
-func sortCapabilities(o *specs.LinuxCapabilities) {
-	sort.Strings(o.Bounding)
-	sort.Strings(o.Effective)
-	sort.Strings(o.Inheritable)
-	sort.Strings(o.Permitted)
-	sort.Strings(o.Ambient)
-}
-
 func validateCapabilities(field, cName string, oldCaps, newCaps *specs.LinuxCapabilities) error {
 	if oldCaps == nil && newCaps == nil {
 		return nil
@@ -224,10 +222,21 @@ func validateCapabilities(field, cName string, oldCaps, newCaps *specs.LinuxCapa
 	if oldCaps == nil || newCaps == nil {
 		return validateError(field, cName, oldCaps, newCaps)
 	}
-	sortCapabilities(oldCaps)
-	sortCapabilities(newCaps)
-	if !reflect.DeepEqual(oldCaps, newCaps) {
-		return validateError(field, cName, oldCaps, newCaps)
+
+	if err := validateArray(field+".Bounding", cName, oldCaps.Bounding, newCaps.Bounding); err != nil {
+		return err
+	}
+	if err := validateArray(field+".Effective", cName, oldCaps.Effective, newCaps.Effective); err != nil {
+		return err
+	}
+	if err := validateArray(field+".Inheritable", cName, oldCaps.Inheritable, newCaps.Inheritable); err != nil {
+		return err
+	}
+	if err := validateArray(field+".Permitted", cName, oldCaps.Permitted, newCaps.Permitted); err != nil {
+		return err
+	}
+	if err := validateArray(field+".Ambient", cName, oldCaps.Ambient, newCaps.Ambient); err != nil {
+		return err
 	}
 	return nil
 }
@@ -300,7 +309,7 @@ func ifNil[T any](v *T) *T {
 // are not resolving any paths in the spec, maybe this is happening at a higher
 // layer. Ideally we should not be resolving any paths, this is a
 // workaround fix.
-func validateArgs(oldArgs, newArgs []string, cwd, cName string) error {
+func validateArgs(oldArgs, newArgs []string, cName string) error {
 	if len(oldArgs) != len(newArgs) {
 		return validateError("Args", cName, oldArgs, newArgs)
 	}
@@ -309,26 +318,16 @@ func validateArgs(oldArgs, newArgs []string, cwd, cName string) error {
 		return nil
 	}
 
-	oldExecPath := oldArgs[0]
-	newExecPath := newArgs[0]
-	hasPrefixOld := strings.HasPrefix(oldExecPath, "./")
-	hasPrefixNew := strings.HasPrefix(newExecPath, "./")
-	if hasPrefixOld == hasPrefixNew {
-		if !slices.Equal(oldArgs, newArgs) {
+	if oldArgs[0] != newArgs[0] {
+		oldExecName := filepath.Base(oldArgs[0])
+		newExecName := filepath.Base(newArgs[0])
+		if oldExecName != newExecName {
 			return validateError("Args", cName, oldArgs, newArgs)
 		}
-		return nil
+		log.Warningf("Validating args with the exec paths, old: %v new: %v", oldArgs[0], newArgs[0])
 	}
 
-	// One of the entrypoints across checkpoint restore is not resolved.
-	// Resolve the entrypoint using cwd to get the absolute path and compare.
-	if hasPrefixOld {
-		oldExecPath = path.Join(cwd, oldExecPath)
-	}
-	if hasPrefixNew {
-		newExecPath = path.Join(cwd, newExecPath)
-	}
-	if oldExecPath != newExecPath || !slices.Equal(oldArgs[1:], newArgs[1:]) {
+	if !slices.Equal(oldArgs[1:], newArgs[1:]) {
 		return validateError("Args", cName, oldArgs, newArgs)
 	}
 	return nil
@@ -381,7 +380,7 @@ func validateSpecForContainer(oSpec, nSpec *specs.Spec, cName string) error {
 		return err
 	}
 	oldProcess.Rlimits, newProcess.Rlimits = nil, nil
-	if err := validateArgs(oldProcess.Args, newProcess.Args, oldProcess.Cwd, cName); err != nil {
+	if err := validateArgs(oldProcess.Args, newProcess.Args, cName); err != nil {
 		return err
 	}
 	oldProcess.Args, newProcess.Args = nil, nil
@@ -459,7 +458,9 @@ func validateSpecs(oldSpecs, newSpecs map[string]*specs.Spec) error {
 		if !ok {
 			return fmt.Errorf("checkpoint image does not contain spec for container: %q", cName)
 		}
-		return validateSpecForContainer(oldSpec, newSpec, cName)
+		if err := validateSpecForContainer(oldSpec, newSpec, cName); err != nil {
+			return fmt.Errorf("failed to validate spec for container %q: %w", cName, err)
+		}
 	}
 
 	return nil

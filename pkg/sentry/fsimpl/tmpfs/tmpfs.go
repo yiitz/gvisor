@@ -32,6 +32,7 @@ package tmpfs
 import (
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -153,6 +154,10 @@ type FilesystemOpts struct {
 	// AllowXattrPrefix is a set of xattr namespace prefixes that this
 	// tmpfs mount will allow.
 	AllowXattrPrefix []string
+
+	// SourceTarFD is the file descriptor of the source tar file to be untarred
+	// into the tmpfs.
+	SourceTarFile *os.File
 }
 
 // Default size limit mount option. It is immutable after initialization.
@@ -193,7 +198,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	allowXattrPrefix := map[string]struct{}{
 		linux.XATTR_TRUSTED_PREFIX: {},
 		linux.XATTR_USER_PREFIX:    {},
-		// The "security" namespace is allowed, but it always returns an error.
+		// Only the "security.capability" xattr is supported.
 		linux.XATTR_SECURITY_PREFIX: {},
 	}
 
@@ -321,6 +326,16 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, fmt.Errorf("invalid tmpfs root file type: %#o", rootFileType)
 	}
 	fs.root = root
+
+	if tmpfsOptsOk && tmpfsOpts.SourceTarFile != nil {
+		defer tmpfsOpts.SourceTarFile.Close()
+
+		if err := fs.UntarUpperLayer(ctx, tmpfsOpts.SourceTarFile); err != nil {
+			fs.vfsfs.DecRef(ctx)
+			return nil, nil, err
+		}
+	}
+
 	return &fs.vfsfs, &root.vfsd, nil
 }
 
@@ -663,7 +678,6 @@ func (i *inode) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs.
 		needsMtimeBump bool
 		needsCtimeBump bool
 	)
-	clearSID := false
 	mask := stat.Mask
 	if mask&linux.STATX_SIZE != 0 {
 		switch impl := i.impl.(type) {
@@ -673,7 +687,6 @@ func (i *inode) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs.
 				return err
 			}
 			if updated {
-				clearSID = true
 				needsMtimeBump = true
 				needsCtimeBump = true
 			}
@@ -686,13 +699,13 @@ func (i *inode) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs.
 	if mask&linux.STATX_UID != 0 {
 		i.uid.Store(stat.UID)
 		needsCtimeBump = true
-		clearSID = true
 	}
 	if mask&linux.STATX_GID != 0 {
 		i.gid.Store(stat.GID)
 		needsCtimeBump = true
-		clearSID = true
 	}
+
+	clearSID := opts.ClearPrivs
 	if mask&linux.STATX_MODE != 0 {
 		for {
 			old := i.mode.Load()
@@ -876,7 +889,7 @@ func (i *inode) setXattr(creds *auth.Credentials, opts *vfs.SetXattrOptions) err
 	if err := vfs.GenericCheckPermissions(creds, vfs.MayWrite, mode, kuid, kgid); err != nil {
 		return err
 	}
-	return i.xattrs.SetXattr(creds, mode, kuid, opts)
+	return i.xattrs.SetXattr(creds, mode, kuid, kgid, opts)
 }
 
 func (i *inode) removeXattr(creds *auth.Credentials, name string) error {

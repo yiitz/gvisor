@@ -30,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/version"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -66,6 +67,12 @@ func (fs *filesystem) newSysDir(ctx context.Context, root *auth.Credentials, k *
 			"yama": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
 				"ptrace_scope": fs.newYAMAPtraceScopeFile(ctx, k, root),
 			}),
+			"keys": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
+				"maxkeys": fs.newMaxKeySizeFile(ctx, k, root),
+			}),
+			"osrelease": fs.newInode(ctx, root, 0444, newStaticFile(version.LinuxRelease)),
+			"ostype":    fs.newInode(ctx, root, 0444, newStaticFile(version.LinuxSysname)),
+			"version":   fs.newInode(ctx, root, 0444, newStaticFile(version.LinuxVersion)),
 		}),
 		"fs": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
 			"nr_open": fs.newInode(ctx, root, 0644, &atomicInt32File{val: &k.MaxFDLimit, min: 8, max: kernel.MaxFdLimit}),
@@ -142,7 +149,7 @@ func (fs *filesystem) newSysNetDir(ctx context.Context, root *auth.Credentials, 
 				"optmem_max":    fs.newInode(ctx, root, 0444, newStaticFile("0")),
 				"rmem_default":  fs.newInode(ctx, root, 0444, newStaticFile("212992")),
 				"rmem_max":      fs.newInode(ctx, root, 0444, newStaticFile("212992")),
-				"somaxconn":     fs.newInode(ctx, root, 0444, newStaticFile("128")),
+				"somaxconn":     fs.newInode(ctx, root, 0444, newStaticFile("1024")),
 				"wmem_default":  fs.newInode(ctx, root, 0444, newStaticFile("212992")),
 				"wmem_max":      fs.newInode(ctx, root, 0444, newStaticFile("212992")),
 			}),
@@ -259,7 +266,7 @@ func (d *tcpRecoveryData) Generate(ctx context.Context, buf *bytes.Buffer) error
 		return err
 	}
 
-	_, err = buf.WriteString(fmt.Sprintf("%d\n", recovery))
+	_, err = fmt.Fprintf(buf, "%d\n", recovery)
 	return err
 }
 
@@ -306,7 +313,7 @@ func (d *tcpMemData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	if err != nil {
 		return err
 	}
-	_, err = buf.WriteString(fmt.Sprintf("%d\t%d\t%d\n", size.Min, size.Default, size.Max))
+	_, err = fmt.Fprintf(buf, "%d\t%d\t%d\n", size.Min, size.Default, size.Max)
 	return err
 }
 

@@ -43,15 +43,14 @@ import (
 	"gvisor.dev/gvisor/pkg/coverage"
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
-	metricpb "gvisor.dev/gvisor/pkg/metric/metric_go_proto"
 	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
-	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
+	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/urpc"
@@ -65,6 +64,8 @@ import (
 	"gvisor.dev/gvisor/runsc/profile"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/starttime"
+
+	metricpb "gvisor.dev/gvisor/pkg/metric/metric_go_proto"
 )
 
 const (
@@ -103,33 +104,35 @@ func createControlSocket(rootDir, id string) (string, int, error) {
 	return "", -1, fmt.Errorf("unable to find location to write socket file")
 }
 
-// pid is an atomic type that implements JSON marshal/unmarshal interfaces.
-type pid struct {
+// Pid is an atomic type that implements JSON marshal/unmarshal interfaces.
+type Pid struct {
 	val atomicbitops.Int64
 }
 
-func (p *pid) store(pid int) {
+// Store stores the PID in p.
+func (p *Pid) Store(pid int) {
 	p.val.Store(int64(pid))
 }
 
-func (p *pid) load() int {
+// Load loads the PID from p.
+func (p *Pid) Load() int {
 	return int(p.val.Load())
 }
 
 // UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON.
-func (p *pid) UnmarshalJSON(b []byte) error {
+func (p *Pid) UnmarshalJSON(b []byte) error {
 	var pid int
 
 	if err := json.Unmarshal(b, &pid); err != nil {
 		return err
 	}
-	p.store(pid)
+	p.Store(pid)
 	return nil
 }
 
 // MarshalJSON implements json.Marshaler.MarshalJSON
-func (p *pid) MarshalJSON() ([]byte, error) {
-	return json.Marshal(p.load())
+func (p *Pid) MarshalJSON() ([]byte, error) {
+	return json.Marshal(p.Load())
 }
 
 // Sandbox wraps a sandbox process.
@@ -155,7 +158,7 @@ type Sandbox struct {
 
 	// Pid is the pid of the running sandbox. May be 0 if the sandbox
 	// is not running.
-	Pid pid `json:"pid"`
+	Pid Pid `json:"pid"`
 
 	// UID is the user ID in the parent namespace that the sandbox is running as.
 	UID int `json:"uid"`
@@ -226,11 +229,17 @@ type Sandbox struct {
 
 	// Restored will be true when the sandbox has been restored.
 	Restored bool `json:"restored"`
+
+	// CPUTimeSaved contains the CPU time saved when the sandbox has been restored.
+	CPUTimeSaved time.Duration `json:"cpuTimeSaved"`
+
+	// WallTimeSaved contains the wall time saved when the sandbox has been restored.
+	WallTimeSaved time.Duration `json:"wallTimeSaved"`
 }
 
 // Getpid returns the process ID of the sandbox process.
 func (s *Sandbox) Getpid() int {
-	return s.Pid.load()
+	return s.Pid.Load()
 }
 
 // Args is used to configure a new sandbox.
@@ -387,7 +396,7 @@ func New(conf *config.Config, args *Args) (*Sandbox, error) {
 
 // CreateSubcontainer creates a container inside the sandbox.
 func (s *Sandbox) CreateSubcontainer(conf *config.Config, cid string, tty *os.File) error {
-	log.Debugf("Create sub-container %q in sandbox %q, PID: %d", cid, s.ID, s.Pid.load())
+	log.Debugf("Create sub-container %q in sandbox %q, PID: %d", cid, s.ID, s.Pid.Load())
 
 	var files []*os.File
 	if tty != nil {
@@ -427,7 +436,7 @@ func (s *Sandbox) StartRoot(conf *config.Config, spec *specs.Spec) error {
 	if err := hostsettings.Handle(conf); err != nil {
 		return fmt.Errorf("host settings: %w (use --host-settings=ignore to bypass)", err)
 	}
-	pid := s.Pid.load()
+	pid := s.Pid.Load()
 	log.Debugf("Start root sandbox %q, PID: %d", s.ID, pid)
 	conn, err := s.sandboxConnect()
 	if err != nil {
@@ -455,17 +464,30 @@ func (s *Sandbox) StartRoot(conf *config.Config, spec *specs.Spec) error {
 
 // StartSubcontainer starts running a sub-container inside the sandbox.
 func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestores []*os.File, devIOFile *os.File, goferConfs []boot.GoferMountConf) error {
-	log.Debugf("Start sub-container %q in sandbox %q, PID: %d", cid, s.ID, s.Pid.load())
+	log.Debugf("Start sub-container %q in sandbox %q, PID: %d", cid, s.ID, s.Pid.Load())
 
 	if err := s.configureStdios(conf, stdios); err != nil {
 		return err
 	}
 	s.fixPidns(spec)
 
+	var rootfsUpperTarFile *os.File
+	if path := specutils.RootfsTarUpperPath(spec); path != "" {
+		var err error
+		rootfsUpperTarFile, err = os.OpenFile(path, os.O_RDONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("opening rootfs upper tar file: %v", err)
+		}
+	}
+	if rootfsUpperTarFile != nil {
+		defer rootfsUpperTarFile.Close()
+	}
+
 	// The payload contains (in this specific order):
 	// * stdin/stdout/stderr (optional: only present when not using TTY)
 	// * The subcontainer's gofer filestore files (optional)
 	// * The subcontainer's dev gofer file (optional)
+	// * The TAR file that contains the upper layer changes of the overlay rootfs.
 	// * Gofer files.
 	payload := urpc.FilePayload{}
 	payload.Files = append(payload.Files, stdios...)
@@ -473,17 +495,21 @@ func (s *Sandbox) StartSubcontainer(spec *specs.Spec, conf *config.Config, cid s
 	if devIOFile != nil {
 		payload.Files = append(payload.Files, devIOFile)
 	}
+	if rootfsUpperTarFile != nil {
+		payload.Files = append(payload.Files, rootfsUpperTarFile)
+	}
 	payload.Files = append(payload.Files, goferFiles...)
 
 	// Start running the container.
 	args := boot.StartArgs{
-		Spec:                 spec,
-		Conf:                 conf,
-		CID:                  cid,
-		NumGoferFilestoreFDs: len(goferFilestores),
-		IsDevIoFilePresent:   devIOFile != nil,
-		GoferMountConfs:      goferConfs,
-		FilePayload:          payload,
+		Spec:                        spec,
+		Conf:                        conf,
+		CID:                         cid,
+		NumGoferFilestoreFDs:        len(goferFilestores),
+		IsDevIoFilePresent:          devIOFile != nil,
+		GoferMountConfs:             goferConfs,
+		IsRootfsUpperTarFilePresent: rootfsUpperTarFile != nil,
+		FilePayload:                 payload,
 	}
 	if err := s.call(boot.ContMgrStartSubcontainer, &args, nil); err != nil {
 		return fmt.Errorf("starting sub-container %v: %w", spec.Process.Args, err)
@@ -499,45 +525,16 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 
 	log.Debugf("Restore sandbox %q from path %q", s.ID, imagePath)
 
-	stateFileName := path.Join(imagePath, boot.CheckpointStateFileName)
-	sf, err := os.Open(stateFileName)
-	if err != nil {
-		return fmt.Errorf("opening state file %q failed: %v", stateFileName, err)
-	}
-	defer sf.Close()
-
 	opt := boot.RestoreOpts{
-		FilePayload: urpc.FilePayload{
-			Files: []*os.File{sf},
-		},
 		Background: background,
 	}
-
-	// If the pages file exists, we must pass it in.
-	pagesFileName := path.Join(imagePath, boot.CheckpointPagesFileName)
-	pagesReadFlags := os.O_RDONLY
-	if direct {
-		// The contents are page-aligned, so it can be opened with O_DIRECT.
-		pagesReadFlags |= syscall.O_DIRECT
-	}
-	if pf, err := os.OpenFile(pagesFileName, pagesReadFlags, 0); err == nil {
-		defer pf.Close()
-		pagesMetadataFileName := path.Join(imagePath, boot.CheckpointPagesMetadataFileName)
-		pmf, err := os.Open(pagesMetadataFileName)
-		if err != nil {
-			return fmt.Errorf("opening restore image file %q failed: %v", pagesMetadataFileName, err)
+	defer func() {
+		for _, f := range opt.FilePayload.Files {
+			_ = f.Close()
 		}
-		defer pmf.Close()
-
-		opt.HavePagesFile = true
-		opt.FilePayload.Files = append(opt.FilePayload.Files, pmf, pf)
-		log.Infof("Found page files for sandbox %q. Page metadata: %q, pages: %q", s.ID, pagesMetadataFileName, pagesFileName)
-
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("opening restore pages file %q failed: %v", pagesFileName, err)
-
-	} else {
-		log.Infof("Using single checkpoint file for sandbox %q", s.ID)
+	}()
+	if err := s.setRestoreOptsImpl(conf, imagePath, direct, &opt); err != nil {
+		return err
 	}
 
 	// If the platform needs a device FD we must pass it in.
@@ -561,7 +558,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 		return err
 	}
 	// Configure the network.
-	if err := setupNetwork(conn, s.Pid.load(), conf, disableIPv6); err != nil {
+	if err := setupNetwork(conn, s.Pid.Load(), conf, disableIPv6); err != nil {
 		return fmt.Errorf("setting up network: %v", err)
 	}
 
@@ -573,9 +570,42 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	return nil
 }
 
+func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, imagePath string, direct bool, opt *boot.RestoreOpts) error {
+	stateFileName := path.Join(imagePath, checkpointfiles.StateFileName)
+	sf, err := os.Open(stateFileName)
+	if err != nil {
+		return fmt.Errorf("opening state file %q failed: %w", stateFileName, err)
+	}
+	opt.FilePayload.Files = append(opt.FilePayload.Files, sf)
+
+	// If either the pages metadata file or pages file exist, both must exist,
+	// and we must pass them in.
+	pagesMetadataFileName := path.Join(imagePath, checkpointfiles.PagesMetadataFileName)
+	if pmf, err := os.Open(pagesMetadataFileName); err == nil {
+		opt.FilePayload.Files = append(opt.FilePayload.Files, pmf)
+		pagesFileName := path.Join(imagePath, checkpointfiles.PagesFileName)
+		pagesReadFlags := os.O_RDONLY
+		if direct {
+			// The contents are page-aligned, so it can be opened with O_DIRECT.
+			pagesReadFlags |= syscall.O_DIRECT
+		}
+		pf, err := os.OpenFile(pagesFileName, pagesReadFlags, 0)
+		if err != nil {
+			return fmt.Errorf("opening pages file %q failed: %w", pagesFileName, err)
+		}
+		opt.FilePayload.Files = append(opt.FilePayload.Files, pf)
+		opt.HavePagesFile = true
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("opening pages metadata file %q failed: %w", pagesMetadataFileName, err)
+	} else {
+		log.Infof("Using single checkpoint file for sandbox %q", s.ID)
+	}
+	return nil
+}
+
 // RestoreSubcontainer sends the restore call for a sub-container in the sandbox.
 func (s *Sandbox) RestoreSubcontainer(spec *specs.Spec, conf *config.Config, cid string, stdios, goferFiles, goferFilestoreFiles []*os.File, devIOFile *os.File, goferMountConf []boot.GoferMountConf) error {
-	log.Debugf("Restore sub-container %q in sandbox %q, PID: %d", cid, s.ID, s.Pid.load())
+	log.Debugf("Restore sub-container %q in sandbox %q, PID: %d", cid, s.ID, s.Pid.Load())
 
 	if err := s.configureStdios(conf, stdios); err != nil {
 		return err
@@ -680,7 +710,7 @@ func (s *Sandbox) ProcfsDump() ([]procfs.ProcessProcfsDump, error) {
 
 // NewCGroup returns the sandbox's Cgroup, or an error if it does not have one.
 func (s *Sandbox) NewCGroup() (cgroup.Cgroup, error) {
-	return cgroup.NewFromPid(s.Pid.load(), false /* useSystemd */)
+	return cgroup.NewFromPid(s.Pid.Load(), false /* useSystemd */)
 }
 
 // Execute runs the specified command in the container. It returns the PID of
@@ -797,7 +827,7 @@ func (s *Sandbox) call(method string, arg, result any) error {
 }
 
 func (s *Sandbox) connError(err error) error {
-	return fmt.Errorf("connecting to control server at PID %d: %v", s.Pid.load(), err)
+	return fmt.Errorf("connecting to control server at PID %d: %v", s.Pid.Load(), err)
 }
 
 // createSandboxProcess starts the sandbox as a subprocess by running the "boot"
@@ -929,6 +959,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	if err := donations.OpenAndDonate("final-metrics-log-fd", conf.FinalMetricsLog, profFlags); err != nil {
 		return fmt.Errorf("donating final metrics log file: %w", err)
 	}
+	if err := donations.OpenAndDonate("rootfs-upper-tar-fd", specutils.RootfsTarUpperPath(args.Spec), os.O_RDONLY); err != nil {
+		return fmt.Errorf("donating rootfs tar file: %w", err)
+	}
 
 	// Pass gofer mount configs.
 	cmd.Args = append(cmd.Args, "--gofer-mount-confs="+args.GoferMountConfs.String())
@@ -961,7 +994,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		donations.DonateAndClose("save-fds", files...)
 	}
 
-	if err := createSandboxProcessExtra(conf, args, &donations); err != nil {
+	if err := s.createSandboxProcessExtra(conf, args, cmd, &donations); err != nil {
 		return err
 	}
 
@@ -1041,6 +1074,13 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 				}
 				defer syncFile.Close()
 				setUserMappings = true
+				uid, gid := SandboxUserGroupIDs(args.Spec)
+				if uid != 0 {
+					cmd.Args = append(cmd.Args, fmt.Sprintf("--uid=%d", uid))
+				}
+				if gid != 0 {
+					cmd.Args = append(cmd.Args, fmt.Sprintf("--gid=%d", gid))
+				}
 			} else {
 				specutils.SetUIDGIDMappings(cmd, args.Spec)
 				// We need to set UID and GID to have capabilities in a new user namespace.
@@ -1287,10 +1327,34 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 	}
 
 	s.child = true
-	s.Pid.store(cmd.Process.Pid)
+	s.Pid.Store(cmd.Process.Pid)
 	log.Infof("Sandbox started, PID: %d", cmd.Process.Pid)
 
 	return nil
+}
+
+func rootMappedInContainer(IDMap []specs.LinuxIDMapping) bool {
+	for _, idMap := range IDMap {
+		if idMap.ContainerID == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func SandboxUserGroupIDs(spec *specs.Spec) (uint32, uint32) {
+	uid := uint32(0)
+	gid := uint32(0)
+
+	if !rootMappedInContainer(spec.Linux.UIDMappings) {
+		uid = spec.Process.User.UID
+	}
+
+	if !rootMappedInContainer(spec.Linux.GIDMappings) {
+		gid = spec.Process.User.GID
+	}
+
+	return uid, gid
 }
 
 // Wait waits for the containerized process to exit, and returns its WaitStatus.
@@ -1367,6 +1431,12 @@ func (s *Sandbox) WaitCheckpoint() error {
 	return s.call(boot.ContMgrWaitCheckpoint, nil, nil)
 }
 
+// WaitRestore waits for the Kernel to have been successfully restored.
+func (s *Sandbox) WaitRestore() error {
+	log.Debugf("Waiting for restore to complete in sandbox %q", s.ID)
+	return s.call(boot.ContMgrWaitRestore, nil, nil)
+}
+
 // IsRootContainer returns true if the specified container ID belongs to the
 // root container.
 func (s *Sandbox) IsRootContainer(cid string) bool {
@@ -1384,7 +1454,7 @@ func (s *Sandbox) destroy() error {
 			log.Warningf("failed to delete control socket file %q: %v", controlSocketPath, err)
 		}
 	}
-	pid := s.Pid.load()
+	pid := s.Pid.Load()
 	if pid != 0 {
 		log.Debugf("Killing sandbox %q", s.ID)
 		if err := unix.Kill(pid, unix.SIGKILL); err != nil && err != unix.ESRCH {
@@ -1443,29 +1513,43 @@ func (s *Sandbox) SignalProcess(cid string, pid int32, sig unix.Signal, fgProces
 	return nil
 }
 
+// CheckpointOpts contains the options for checkpointing a sandbox.
+type CheckpointOpts struct {
+	Compression               statefile.CompressionLevel
+	Resume                    bool
+	Direct                    bool
+	ExcludeCommittedZeroPages bool
+
+	// Save/restore exec options.
+	SaveRestoreExecArgv        string
+	SaveRestoreExecTimeout     time.Duration
+	SaveRestoreExecContainerID string
+
+	checkpointOptsExtra
+}
+
 // Checkpoint sends the checkpoint call for a container in the sandbox.
 // The statefile will be written to f.
-func (s *Sandbox) Checkpoint(cid string, imagePath string, direct bool, sfOpts statefile.Options, mfOpts pgalloc.SaveOpts) error {
-	log.Debugf("Checkpoint sandbox %q, statefile options %+v, MemoryFile options %+v", s.ID, sfOpts, mfOpts)
+func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, opts CheckpointOpts) error {
+	log.Debugf("Checkpoint sandbox %q, imagePath %q, opts %+v", s.ID, imagePath, opts)
 
-	files, err := createSaveFiles(imagePath, direct, sfOpts.Compression)
-	if err != nil {
-		return err
+	opt := control.SaveOpts{
+		Metadata:                       opts.Compression.ToMetadata(),
+		AppMFExcludeCommittedZeroPages: opts.ExcludeCommittedZeroPages,
+		Resume:                         opts.Resume,
+		ExecOpts: control.SaveRestoreExecOpts{
+			Argv:        opts.SaveRestoreExecArgv,
+			Timeout:     opts.SaveRestoreExecTimeout,
+			ContainerID: opts.SaveRestoreExecContainerID,
+		},
 	}
 	defer func() {
-		for _, f := range files {
+		for _, f := range opt.FilePayload.Files {
 			_ = f.Close()
 		}
 	}()
-
-	opt := control.SaveOpts{
-		Metadata:           sfOpts.WriteToMetadata(map[string]string{}),
-		MemoryFileSaveOpts: mfOpts,
-		FilePayload: urpc.FilePayload{
-			Files: files,
-		},
-		HavePagesFile: len(files) > 1,
-		Resume:        sfOpts.Resume,
+	if err := s.setCheckpointOptsImpl(conf, imagePath, opts, &opt); err != nil {
+		return err
 	}
 
 	if err := s.call(boot.ContMgrCheckpoint, &opt, nil); err != nil {
@@ -1475,13 +1559,23 @@ func (s *Sandbox) Checkpoint(cid string, imagePath string, direct bool, sfOpts s
 	return nil
 }
 
+func setCheckpointOptsForLocalCheckpointFiles(conf *config.Config, imagePath string, opts CheckpointOpts, opt *control.SaveOpts) error {
+	files, err := createSaveFiles(imagePath, opts.Direct, opts.Compression)
+	if err != nil {
+		return err
+	}
+	opt.FilePayload.Files = files
+	opt.HavePagesFile = len(files) > 1
+	return nil
+}
+
 // createSaveFiles creates the files used by checkpoint to save the state. They are returned in
 // the following order: sentry state, page metadata, page file. This is the same order expected by
 // RPCs and argument passing to the sandbox.
 func createSaveFiles(path string, direct bool, compression statefile.CompressionLevel) ([]*os.File, error) {
 	var files []*os.File
 
-	stateFilePath := filepath.Join(path, boot.CheckpointStateFileName)
+	stateFilePath := filepath.Join(path, checkpointfiles.StateFileName)
 	f, err := os.OpenFile(stateFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("creating checkpoint state file %q: %w", stateFilePath, err)
@@ -1492,14 +1586,14 @@ func createSaveFiles(path string, direct bool, compression statefile.Compression
 	// It is beneficial to store them separately so certain optimizations can be
 	// applied during restore. See Restore().
 	if compression == statefile.CompressionLevelNone {
-		pagesMetadataFilePath := filepath.Join(path, boot.CheckpointPagesMetadataFileName)
+		pagesMetadataFilePath := filepath.Join(path, checkpointfiles.PagesMetadataFileName)
 		f, err = os.OpenFile(pagesMetadataFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
 		if err != nil {
 			return nil, fmt.Errorf("creating checkpoint pages metadata file %q: %w", pagesMetadataFilePath, err)
 		}
 		files = append(files, f)
 
-		pagesFilePath := filepath.Join(path, boot.CheckpointPagesFileName)
+		pagesFilePath := filepath.Join(path, checkpointfiles.PagesFileName)
 		pagesWriteFlags := os.O_CREATE | os.O_EXCL | os.O_RDWR
 		if direct {
 			// The writes will be page-aligned, so it can be opened with O_DIRECT.
@@ -1574,6 +1668,20 @@ func (s *Sandbox) GetRegisteredMetrics() (*metricpb.MetricRegistration, error) {
 // ExportMetrics returns a snapshot of metric values from the sandbox in Prometheus format.
 func (s *Sandbox) ExportMetrics(opts control.MetricsExportOpts) (*prometheus.Snapshot, error) {
 	log.Debugf("Metrics export sandbox %q", s.ID)
+
+	// Update time saved metrics before exporting, if not exported already for
+	// restored sandboxes.
+	if s.Restored && s.CPUTimeSaved == 0 && s.WallTimeSaved == 0 {
+		var savings boot.Savings
+		err := s.call(boot.ContMgrGetSavings, nil, &savings)
+		if err != nil {
+			log.Warningf("Failed to get time saved metrics")
+		} else {
+			s.CPUTimeSaved = savings.CPUTimeSaved
+			s.WallTimeSaved = savings.WallTimeSaved
+		}
+	}
+
 	var data control.MetricsExportData
 	if err := s.call(boot.MetricsExport, &opts, &data); err != nil {
 		return nil, err
@@ -1588,7 +1696,7 @@ func (s *Sandbox) ExportMetrics(opts control.MetricsExportOpts) (*prometheus.Sna
 
 // IsRunning returns true if the sandbox or gofer process is running.
 func (s *Sandbox) IsRunning() bool {
-	pid := s.Pid.load()
+	pid := s.Pid.Load()
 	if pid == 0 {
 		return false
 	}
@@ -1609,6 +1717,9 @@ func (s *Sandbox) Stacks() (string, error) {
 
 // HeapProfile writes a heap profile to the given file.
 func (s *Sandbox) HeapProfile(f *os.File, delay time.Duration) error {
+	if delay > 0 {
+		log.Infof("Delaying heap profile collection for %v", delay)
+	}
 	log.Debugf("Heap profile %q", s.ID)
 	opts := control.HeapProfileOpts{
 		FilePayload: urpc.FilePayload{Files: []*os.File{f}},
@@ -1699,7 +1810,7 @@ func (s *Sandbox) waitForStopped() error {
 	if s.child {
 		s.statusMu.Lock()
 		defer s.statusMu.Unlock()
-		pid := s.Pid.load()
+		pid := s.Pid.Load()
 		if pid == 0 {
 			return nil
 		}
@@ -1708,7 +1819,7 @@ func (s *Sandbox) waitForStopped() error {
 		if _, err := unix.Wait4(int(pid), &s.status, 0, nil); err != nil {
 			return fmt.Errorf("error waiting the sandbox process: %v", err)
 		}
-		s.Pid.store(0)
+		s.Pid.Store(0)
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), waitTimeout)
@@ -1856,7 +1967,7 @@ func (s *Sandbox) fixPidns(spec *specs.Spec) {
 		// pidns was not set, nothing to fix.
 		return
 	}
-	if pidns.Path != fmt.Sprintf("/proc/%d/ns/pid", s.Pid.load()) {
+	if pidns.Path != fmt.Sprintf("/proc/%d/ns/pid", s.Pid.Load()) {
 		// Fix only if the PID namespace corresponds to the sandbox's.
 		return
 	}
@@ -1977,6 +2088,21 @@ func (s *Sandbox) ContainerRuntimeState(cid string) (boot.ContainerRuntimeState,
 	}
 	log.Debugf("ContainerRuntimeState, sandbox: %q, cid: %q, state: %v", s.ID, cid, state)
 	return state, nil
+}
+
+// TarRootfsUpperLayer serializes the rootfs upper layer of a given
+// container to a tar file. When the rootfs is not an overlayfs, it
+// returns an error. It writes the tar file to outFD.
+func (s *Sandbox) TarRootfsUpperLayer(containerID string, outFD *os.File) error {
+	log.Debugf("TarRootfsUpperLayer, sandbox: %q, container: %q", s.ID, containerID)
+	opts := control.TarRootfsUpperLayerOpts{
+		ContainerID: containerID,
+		FilePayload: urpc.FilePayload{Files: []*os.File{outFD}},
+	}
+	if err := s.call(boot.FsTarRootfsUpperLayer, &opts, nil); err != nil {
+		return fmt.Errorf("serializing rootfs upper layer to tar: %w", err)
+	}
+	return nil
 }
 
 func setCloExeOnAllFDs() error {

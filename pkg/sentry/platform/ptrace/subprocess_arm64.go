@@ -85,7 +85,6 @@ func isSingleStepping(regs *arch.Registers) bool {
 // updateSyscallRegs updates registers after finishing sysemu.
 func updateSyscallRegs(regs *arch.Registers) {
 	// No special work is necessary.
-	return
 }
 
 // syscallReturnValue extracts a sensible return from registers.
@@ -154,7 +153,7 @@ func enableCpuidFault() {
 
 // appendArchSeccompRules append architecture specific seccomp rules when creating BPF program.
 // Ref attachedThread() for more detail.
-func appendArchSeccompRules(rules []seccomp.RuleSet, defaultAction linux.BPFAction) []seccomp.RuleSet {
+func appendArchSeccompRules(rules []seccomp.RuleSet, defaultAction seccomp.Action) []seccomp.RuleSet {
 	return rules
 }
 
@@ -193,7 +192,7 @@ func (s *subprocess) arm64SyscallWorkaround(t *thread, regs *arch.Registers) {
 			continue
 		}
 		if sig == (syscallEvent | unix.SIGTRAP) {
-			t.dumpAndPanic(fmt.Sprintf("unexpected syscall event"))
+			t.dumpAndPanic("unexpected syscall event")
 		}
 		break
 	}

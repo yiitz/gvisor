@@ -25,15 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-// BlockWithTimeout blocks t until an event is received from C, the application
-// monotonic clock indicates that timeout has elapsed (only if haveTimeout is true),
-// or t is interrupted. It returns:
-//
-//   - The remaining timeout, which is guaranteed to be 0 if the timeout expired,
-//     and is unspecified if haveTimeout is false.
-//
-//   - An error which is nil if an event is received from C, ETIMEDOUT if the timeout
-//     expired, and linuxerr.ErrInterrupted if t is interrupted.
+// BlockWithTimeout implements context.Context.BlockWithTimeout.
 //
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) BlockWithTimeout(C chan struct{}, haveTimeout bool, timeout time.Duration) (time.Duration, error) {
@@ -65,6 +57,8 @@ func (t *Task) BlockWithTimeout(C chan struct{}, haveTimeout bool, timeout time.
 }
 
 // BlockWithTimeoutOn implements context.Context.BlockWithTimeoutOn.
+//
+// Preconditions: The caller must be running on the task goroutine.
 func (t *Task) BlockWithTimeoutOn(w waiter.Waitable, mask waiter.EventMask, timeout time.Duration) (time.Duration, bool) {
 	e, ch := waiter.NewChannelEntry(mask)
 	w.EventRegister(&e)
@@ -146,11 +140,15 @@ func (t *Task) blockWithDeadlineFromSampledClock(C <-chan struct{}, clock ktime.
 }
 
 // Block implements context.Context.Block
+//
+// Preconditions: The caller must be running on the task goroutine.
 func (t *Task) Block(C <-chan struct{}) error {
 	return t.block(C, nil)
 }
 
 // BlockOn implements context.Context.BlockOn.
+//
+// Preconditions: The caller must be running on the task goroutine.
 func (t *Task) BlockOn(w waiter.Waitable, mask waiter.EventMask) bool {
 	e, ch := waiter.NewChannelEntry(mask)
 	w.EventRegister(&e)
@@ -213,18 +211,16 @@ func (t *Task) block(C <-chan struct{}, timerChan <-chan struct{}) error {
 	}
 }
 
-// prepareSleep prepares to sleep.
+// prepareSleep is called immediately before the task goroutine blocks.
 func (t *Task) prepareSleep() {
 	t.assertTaskGoroutine()
 	t.p.PrepareSleep()
-	t.Deactivate()
 	t.accountTaskGoroutineEnter(TaskGoroutineBlockedInterruptible)
 }
 
-// completeSleep reactivates the address space.
+// completeSleep is called immediately after the task goroutine unblocks.
 func (t *Task) completeSleep() {
 	t.accountTaskGoroutineLeave(TaskGoroutineBlockedInterruptible)
-	t.Activate()
 }
 
 // Interrupted implements context.Context.Interrupted.
@@ -234,25 +230,20 @@ func (t *Task) Interrupted() bool {
 	}
 	// Indicate that t's task goroutine is still responsive (i.e. reset the
 	// watchdog timer).
-	t.accountTaskGoroutineRunning()
+	t.touchGostateTime()
 	return false
 }
 
 // UninterruptibleSleepStart implements context.Context.UninterruptibleSleepStart.
-func (t *Task) UninterruptibleSleepStart(deactivate bool) {
+func (t *Task) UninterruptibleSleepStart() {
 	t.assertTaskGoroutine()
-	if deactivate {
-		t.Deactivate()
-	}
+	t.p.PrepareUninterruptibleSleep()
 	t.accountTaskGoroutineEnter(TaskGoroutineBlockedUninterruptible)
 }
 
 // UninterruptibleSleepFinish implements context.Context.UninterruptibleSleepFinish.
-func (t *Task) UninterruptibleSleepFinish(activate bool) {
+func (t *Task) UninterruptibleSleepFinish() {
 	t.accountTaskGoroutineLeave(TaskGoroutineBlockedUninterruptible)
-	if activate {
-		t.Activate()
-	}
 }
 
 // interrupted returns true if interrupt or interruptSelf has been called at

@@ -20,6 +20,7 @@ package packetmmap
 
 import (
 	"fmt"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
@@ -70,19 +71,18 @@ type Endpoint struct {
 	mode ringBufferMode
 	// +checklocks:mu
 	cooked bool
+	// +checklocks:mu
+	stack *stack.Stack
 
 	packetEP  stack.MappablePacketEndpoint
 	reserve   uint32
-	nicID     tcpip.NICID
-	netProto  tcpip.NetworkProtocolNumber
 	version   int
 	headerLen uint32
 
 	received atomicbitops.Uint32
 	dropped  atomicbitops.Uint32
 
-	stack *stack.Stack
-	wq    *waiter.Queue
+	wq *waiter.Queue
 
 	mappingsMu sync.Mutex `state:"nosave"`
 	// +checklocks:mappingsMu
@@ -95,16 +95,18 @@ type Endpoint struct {
 func (m *Endpoint) Init(ctx context.Context, opts stack.PacketMMapOpts) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if m.mapped.Load() != 0 {
+		return linuxerr.EINVAL
+	}
+
 	m.stack = opts.Stack
 	m.wq = opts.Wq
 	m.cooked = opts.Cooked
 	m.packetEP = opts.PacketEndpoint
-	m.nicID = opts.NICID
-	m.netProto = opts.NetProto
 	m.version = opts.Version
 	m.reserve = opts.Reserve
-	m.nicID = opts.NICID
-	m.netProto = opts.NetProto
+
 	switch m.version {
 	case linux.TPACKET_V1:
 		m.headerLen = linux.TPACKET_HDRLEN
@@ -113,6 +115,7 @@ func (m *Endpoint) Init(ctx context.Context, opts stack.PacketMMapOpts) error {
 	default:
 		panic(fmt.Sprintf("invalid version %d supplied to InitPacketMMap", m.version))
 	}
+
 	if opts.Req.TpBlockNr != 0 {
 		if opts.Req.TpBlockSize <= 0 {
 			return linuxerr.EINVAL
@@ -139,6 +142,7 @@ func (m *Endpoint) Init(ctx context.Context, opts stack.PacketMMapOpts) error {
 	} else if opts.Req.TpFrameNr != 0 {
 		return linuxerr.EINVAL
 	}
+
 	if opts.IsRx {
 		if err := m.rxRingBuffer.init(ctx, opts.Req); err != nil {
 			return err
@@ -184,7 +188,11 @@ func (m *Endpoint) Readiness(mask waiter.EventMask) waiter.EventMask {
 }
 
 // HandlePacket implements stack.PacketMMapEndpoint.HandlePacket.
-func (m *Endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+func (m *Endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) bool {
+	if !m.Mapped() {
+		return false
+	}
+
 	const minMacLen = 16
 	var (
 		status                           = uint32(linux.TP_STATUS_USER)
@@ -194,11 +202,14 @@ func (m *Endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtoco
 
 	m.mu.Lock()
 	cooked := m.cooked
+	stats := m.stack.Stats()
+	hdrLen := m.headerLen
+	reserve := m.reserve
 	if !m.rxRingBuffer.hasRoom() {
 		m.mu.Unlock()
-		m.stack.Stats().DroppedPackets.Increment()
+		stats.DroppedPackets.Increment()
 		m.dropped.Add(1)
-		return
+		return true
 	}
 	m.mu.Unlock()
 
@@ -214,14 +225,14 @@ func (m *Endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtoco
 		pktBuf.TrimFront(int64(len(pkt.LinkHeader().Slice()) + len(pkt.VirtioNetHeader().Slice())))
 		// Cooked packet endpoints don't include the link-headers in received
 		// packets.
-		netOffset = linux.TPacketAlign(m.headerLen+minMacLen) + m.reserve
+		netOffset = linux.TPacketAlign(hdrLen+minMacLen) + reserve
 		macOffset = netOffset
 	} else {
 		virtioNetHdrLen := uint32(len(pkt.VirtioNetHeader().Slice()))
 		macLen := uint32(len(pkt.LinkHeader().Slice())) + virtioNetHdrLen
-		netOffset = linux.TPacketAlign(m.headerLen+macLen) + m.reserve
+		netOffset = linux.TPacketAlign(hdrLen+macLen) + reserve
 		if macLen < minMacLen {
-			netOffset = linux.TPacketAlign(m.headerLen+minMacLen) + m.reserve
+			netOffset = linux.TPacketAlign(hdrLen+minMacLen) + reserve
 		}
 		if virtioNetHdrLen > 0 {
 			netOffset += virtioNetHdrLen
@@ -229,18 +240,18 @@ func (m *Endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtoco
 		macOffset = netOffset - macLen
 	}
 	if netOffset > uint32(^uint16(0)) {
-		m.stack.Stats().DroppedPackets.Increment()
+		stats.DroppedPackets.Increment()
 		m.dropped.Add(1)
-		return
+		return true
 	}
 	dataLength = uint32(pktBuf.Size())
 
 	// If the packet is too large to fit in the ring buffer, copy it to the
 	// receive queue.
-	if macOffset+dataLength > m.rxRingBuffer.frameSize {
+	if macOffset+dataLength > m.rxRingBuffer.FrameSize() {
 		clone = pkt.Clone()
 		defer clone.DecRef()
-		dataLength = m.rxRingBuffer.frameSize - macOffset
+		dataLength = m.rxRingBuffer.FrameSize() - macOffset
 		if int(dataLength) < 0 {
 			dataLength = 0
 		}
@@ -250,17 +261,17 @@ func (m *Endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtoco
 	tpStatus, err := m.rxRingBuffer.currFrameStatus()
 	if err != nil || tpStatus != linux.TP_STATUS_KERNEL {
 		m.mu.Unlock()
-		m.stack.Stats().DroppedPackets.Increment()
+		stats.DroppedPackets.Increment()
 		m.dropped.Add(1)
-		return
+		return true
 	}
 
 	slot, ok := m.rxRingBuffer.testAndMarkHead()
 	if !ok {
 		m.mu.Unlock()
-		m.stack.Stats().DroppedPackets.Increment()
+		stats.DroppedPackets.Increment()
 		m.dropped.Add(1)
-		return
+		return true
 	}
 	m.rxRingBuffer.incHead()
 
@@ -268,30 +279,33 @@ func (m *Endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtoco
 		status |= linux.TP_STATUS_COPY
 		m.packetEP.HandlePacketMMapCopy(nicID, netProto, clone)
 	}
+	t := m.stack.Clock().Now()
+	version := m.version
 	m.mu.Unlock()
 
 	// Unlock around writing to the internal mappings to allow other threads to
 	// write to the ring buffer.
 	hdrView := buffer.NewViewSize(int(macOffset))
-	m.marshalFrameHeader(pktBuf, macOffset, netOffset, dataLength, hdrView)
+	m.marshalFrameHeader(version, t, pktBuf, macOffset, netOffset, dataLength, hdrView)
 	pktBuf.Truncate(int64(dataLength))
-	m.marshalSockAddr(pkt, hdrView)
+	m.marshalSockAddr(version, pkt, netProto, nicID, hdrView)
 
 	if err := m.rxRingBuffer.writeFrame(slot, hdrView, pktBuf); err != nil {
-		m.stack.Stats().DroppedPackets.Increment()
+		stats.DroppedPackets.Increment()
 		m.dropped.Add(1)
-		return
+		return true
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := m.rxRingBuffer.writeStatus(slot, status); err != nil {
-		m.stack.Stats().DroppedPackets.Increment()
+		stats.DroppedPackets.Increment()
 		m.dropped.Add(1)
-		return
+		return true
 	}
 	m.received.Add(1)
 	m.wq.Notify(waiter.ReadableEvents)
+	return true
 }
 
 // AddMapping implements memmap.Mappable.AddMapping.
@@ -407,12 +421,12 @@ func toLinuxPacketType(pktType tcpip.PacketType) uint8 {
 	}
 }
 
-func (m *Endpoint) marshalSockAddr(pkt *stack.PacketBuffer, view *buffer.View) {
+func (m *Endpoint) marshalSockAddr(version int, pkt *stack.PacketBuffer, netProto tcpip.NetworkProtocolNumber, nicID tcpip.NICID, view *buffer.View) {
 	var sll linux.SockAddrLink
 	sll.Family = linux.AF_PACKET
-	sll.Protocol = socket.Htons(uint16(m.netProto))
+	sll.Protocol = socket.Htons(uint16(netProto))
 	sll.PacketType = toLinuxPacketType(pkt.PktType)
-	sll.InterfaceIndex = int32(m.nicID)
+	sll.InterfaceIndex = int32(nicID)
 	sll.HardwareAddrLen = header.EthernetAddressSize
 
 	if len(pkt.LinkHeader().Slice()) != 0 {
@@ -420,7 +434,7 @@ func (m *Endpoint) marshalSockAddr(pkt *stack.PacketBuffer, view *buffer.View) {
 		copy(sll.HardwareAddr[:], hdr.SourceAddress())
 	}
 	var hdrSize uint32
-	if m.version == linux.TPACKET_V2 {
+	if version == linux.TPACKET_V2 {
 		hdrSize = uint32((*linux.Tpacket2Hdr)(nil).SizeBytes())
 	} else {
 		hdrSize = uint32((*linux.TpacketHdr)(nil).SizeBytes())
@@ -428,9 +442,8 @@ func (m *Endpoint) marshalSockAddr(pkt *stack.PacketBuffer, view *buffer.View) {
 	sll.MarshalBytes(view.AsSlice()[linux.TPacketAlign(hdrSize):])
 }
 
-func (m *Endpoint) marshalFrameHeader(pktBuf buffer.Buffer, macOffset, netOffset, dataLength uint32, view *buffer.View) {
-	t := m.stack.Clock().Now()
-	switch m.version {
+func (m *Endpoint) marshalFrameHeader(version int, t time.Time, pktBuf buffer.Buffer, macOffset, netOffset, dataLength uint32, view *buffer.View) {
+	switch version {
 	case linux.TPACKET_V1:
 		hdr := linux.TpacketHdr{
 			// The status is set separately to ensure the frame is written before the

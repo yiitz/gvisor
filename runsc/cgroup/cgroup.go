@@ -316,6 +316,7 @@ func loadPathsHelper(cgroup, mountinfo io.Reader, unified bool) (map[string]stri
 // Cgroup represents a cgroup configuration.
 type Cgroup interface {
 	Install(res *specs.LinuxResources) error
+	Update(res *specs.LinuxResources) error
 	Uninstall() error
 	Join() (func(), error)
 	CPUQuota() (float64, error)
@@ -539,6 +540,34 @@ func (c *cgroupV1) Install(res *specs.LinuxResources) error {
 		}
 	}
 	clean.Release()
+	return nil
+}
+
+// Update updates the cgroup resources.
+func (c *cgroupV1) Update(res *specs.LinuxResources) error {
+	log.Debugf("Updating cgroup resources for %q", c.Name)
+	for key, ctrlr := range controllers {
+		if !c.Own[key] {
+			// cgroup is managed by caller, don't touch it.
+			continue
+		}
+		path := c.MakePath(key)
+		if _, err := os.Stat(path); err != nil {
+			if os.IsNotExist(err) && ctrlr.optional() {
+				if err := ctrlr.skip(res); err != nil {
+					return err
+				}
+				log.Infof("Skipping cgroup %q, path doesn't exist", key)
+				continue
+			}
+			return fmt.Errorf("failed to stat cgroup %q: %w", key, err)
+		}
+
+		if err := ctrlr.set(res, path); err != nil {
+			return fmt.Errorf("failed to set %q cgroup: %w", key, err)
+		}
+	}
+
 	return nil
 }
 
@@ -959,4 +988,18 @@ func (*hugeTLB) set(spec *specs.LinuxResources, path string) error {
 		}
 	}
 	return nil
+}
+
+// RunInCgroup executes fn inside the specified cgroup. If cg is nil, execute
+// it in the current context.
+func RunInCgroup(cg Cgroup, fn func() error) error {
+	if cg == nil {
+		return fn()
+	}
+	restore, err := cg.Join()
+	if err != nil {
+		return err
+	}
+	defer restore()
+	return fn()
 }

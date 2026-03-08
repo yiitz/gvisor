@@ -16,7 +16,6 @@ package nvproxy
 
 import (
 	"fmt"
-	"path/filepath"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -24,7 +23,6 @@ import (
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/devutil"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -32,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -48,7 +47,7 @@ type frontendDevice struct {
 }
 
 func (dev *frontendDevice) isCtlDevice() bool {
-	return dev.minor == nvgpu.NV_CONTROL_DEVICE_MINOR
+	return dev.minor == nvgpu.NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE
 }
 
 func (dev *frontendDevice) basename() string {
@@ -63,31 +62,12 @@ func (dev *frontendDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.D
 	fd := &frontendFD{
 		dev: dev,
 	}
-	basename := dev.basename()
-	if dev.nvp.useDevGofer {
-		devClient := devutil.GoferClientFromContext(ctx)
-		if devClient == nil {
-			log.Warningf("devutil.CtxDevGoferClient is not set")
-			return nil, linuxerr.ENOENT
-		}
-		fd.containerName = devClient.ContainerName()
-		hostFD, err := devClient.OpenAt(ctx, basename, opts.Flags)
-		if err != nil {
-			ctx.Warningf("nvproxy: failed to open %s: %v", basename, err)
-			return nil, err
-		}
-		fd.hostFD = int32(hostFD)
-	} else {
-		devPath := filepath.Join("/dev", basename)
-		flags := int(opts.Flags&unix.O_ACCMODE | unix.O_NOFOLLOW)
-		hostFD, err := unix.Openat(-1, devPath, flags, 0)
-		if err != nil {
-			ctx.Warningf("nvproxy: failed to open host %s: %v", devPath, err)
-			return nil, err
-		}
-		fd.hostFD = int32(hostFD)
+	var err error
+	fd.hostFD, fd.containerName, err = openHostDevFile(ctx, dev.basename(), dev.nvp.useDevGofer, opts.Flags)
+	if err != nil {
+		return nil, err
 	}
-	if err := fd.vfsfd.Init(fd, opts.Flags, mnt, vfsd, &vfs.FileDescriptionOptions{
+	if err := fd.vfsfd.Init(fd, opts.Flags, auth.CredentialsFromContext(ctx), mnt, vfsd, &vfs.FileDescriptionOptions{
 		UseDentryMetadata: true,
 	}); err != nil {
 		unix.Close(int(fd.hostFD))
@@ -820,6 +800,12 @@ func rmControl(fi *frontendIoctlState) (uintptr, error) {
 		// src/nvidia/interface/deprecated/rmapi_gss_legacy_control.c:RmGssLegacyRpcCmd().
 		return rmControlSimple(fi, &ioctlParams)
 	}
+	if (ioctlParams.Cmd>>16)&0xffff == nvgpu.NV2081_BINAPI {
+		// NV2081_BINAPI forwards all control commands to the GSP in
+		// src/nvidia/src/kernel/rmapi/binary_api.c:binapiControl_IMPL().
+		// Consequently, its parameters cannot reasonably contain pointers.
+		return rmControlSimple(fi, &ioctlParams)
+	}
 	// Implementors:
 	// - Top two bytes of Cmd specifies class; third byte specifies category;
 	// fourth byte specifies "message ID" (command within class/category).
@@ -840,7 +826,11 @@ func rmControl(fi *frontendIoctlState) (uintptr, error) {
 	if err != nil {
 		if handleErr, ok := err.(*errHandler); ok {
 			fi.ctx.Warningf("nvproxy: %v for control command %#x (paramsSize=%d)", handleErr, ioctlParams.Cmd, ioctlParams.ParamsSize)
-			return 0, linuxerr.EINVAL
+			// See src/nvidia/src/libraries/resserv/src/rs_resource.c:resControlLookup_IMPL()
+			// when pEntry is null.
+			ioctlParams.Status = nvgpu.NV_ERR_NOT_SUPPORTED
+			_, err := ioctlParams.CopyOut(fi.t, fi.ioctlParamsAddr)
+			return 0, err
 		}
 	}
 	return result, err
@@ -971,6 +961,10 @@ func ctrlClientSystemGetBuildVersion(fi *frontendIoctlState, ioctlParams *nvgpu.
 	if ctrlParams.SizeOfStrings == 0 {
 		return 0, linuxerr.EINVAL
 	}
+	// The driver internally uses NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION_V2 to
+	// fetch the version strings, which has a maximum string size limit. Any
+	// extra buffer space provided by the user is ignored.
+	ctrlParams.SizeOfStrings = min(ctrlParams.SizeOfStrings, nvgpu.NV0000_CTRL_SYSTEM_GET_BUILD_VERSION_V2_MAX_STRING_SIZE)
 	driverVersionBuf := make([]byte, ctrlParams.SizeOfStrings)
 	versionBuf := make([]byte, ctrlParams.SizeOfStrings)
 	titleBuf := make([]byte, ctrlParams.SizeOfStrings)
@@ -1366,6 +1360,52 @@ func rmAllocContextShare(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAM
 		// is required.
 		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, newRmAllocObject(fi.fd, ioctlParams, rightsRequested, allocParams), ioctlParams.HObjectParent, allocParams.HVASpace)
 	})
+}
+
+func rmAllocIMEXSession(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
+	var allocParams nvgpu.NV00F1_ALLOCATION_PARAMETERS
+	if _, err := allocParams.CopyIn(fi.t, addrFromP64(ioctlParams.PAllocParms)); err != nil {
+		return 0, err
+	}
+
+	origCapDescriptor := allocParams.CapDescriptor
+	capsFileGeneric, _ := fi.t.FDTable().Get(int32(allocParams.CapDescriptor))
+	if capsFileGeneric == nil {
+		return 0, linuxerr.EINVAL
+	}
+	defer capsFileGeneric.DecRef(fi.ctx)
+	capsFile, ok := capsFileGeneric.Impl().(*openOnlyFD)
+	if !ok {
+		fi.ctx.Warningf("nvproxy: rmAllocIMEXSession got capDescriptor file of incompatible type %T", capsFileGeneric.Impl())
+		return 0, linuxerr.EINVAL
+	}
+	allocParams.CapDescriptor = uint64(capsFile.hostFD)
+
+	origEventFD := allocParams.POsEvent
+	eventFileGeneric, _ := fi.t.FDTable().Get(int32(allocParams.POsEvent))
+	if eventFileGeneric == nil {
+		return 0, linuxerr.EINVAL
+	}
+	defer eventFileGeneric.DecRef(fi.ctx)
+	eventFile, ok := eventFileGeneric.Impl().(*frontendFD)
+	if !ok {
+		return 0, linuxerr.EINVAL
+	}
+	allocParams.POsEvent = nvgpu.P64(uint64(eventFile.hostFD))
+
+	n, err := rmAllocInvoke(fi, ioctlParams, &allocParams, isNVOS64, func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV00F1_ALLOCATION_PARAMETERS) {
+		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, &miscObject{}, ioctlParams.HObjectParent)
+	})
+	if err != nil {
+		return n, err
+	}
+
+	allocParams.CapDescriptor = origCapDescriptor
+	allocParams.POsEvent = origEventFD
+	if _, err := allocParams.CopyOut(fi.t, addrFromP64(ioctlParams.PAllocParms)); err != nil {
+		return n, err
+	}
+	return n, nil
 }
 
 // See src/nvidia/interface/deprecated/rmapi_deprecated_misc.c:RmDeprecatedIdleChannels().

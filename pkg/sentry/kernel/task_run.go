@@ -24,7 +24,6 @@ import (
 	"gvisor.dev/gvisor/pkg/goid"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/sentry/hostcpu"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -68,13 +67,6 @@ func (t *Task) run(threadID uintptr) {
 	t.blockingTimerListener, t.blockingTimerChan = ktime.NewChannelNotifier()
 	t.blockingTimer = ktime.NewSampledTimer(t.k.MonotonicClock(), t.blockingTimerListener)
 	defer t.blockingTimer.Destroy()
-
-	// Activate our address space.
-	t.Activate()
-	// The corresponding t.Deactivate occurs in the exit path
-	// (runExitMain.execute) so that when
-	// Platform.CooperativelySharesAddressSpace() == true, we give up the
-	// AddressSpace before the task goroutine finishes executing.
 
 	// If this is a newly-started task, it should check for participation in
 	// group stops. If this is a task resuming after restore, it was
@@ -125,10 +117,7 @@ func (t *Task) doStop() {
 	if t.stopCount.Load() == 0 {
 		return
 	}
-	t.Deactivate()
-	// NOTE(b/30316266): t.Activate() must be called without any locks held, so
-	// this defer must precede the defer for unlocking the signal mutex.
-	defer t.Activate()
+	t.p.PrepareStop()
 	t.accountTaskGoroutineEnter(TaskGoroutineStopped)
 	defer t.accountTaskGoroutineLeave(TaskGoroutineStopped)
 	t.tg.signalHandlers.mu.Lock()
@@ -207,7 +196,7 @@ func (app *runApp) execute(t *Task) taskRunState {
 	if t.rseqPreempted {
 		t.rseqPreempted = false
 		if t.rseqAddr != 0 || t.oldRSeqCPUAddr != 0 {
-			t.rseqCPU = int32(hostcpu.GetCPU())
+			t.rseqCPU = t.CPU()
 			if err := t.rseqCopyOutCPU(); err != nil {
 				t.Debugf("Failed to copy CPU to %#x for rseq: %v", t.rseqAddr, err)
 				t.forceSignal(linux.SIGSEGV, false)
@@ -306,6 +295,24 @@ func (app *runApp) execute(t *Task) taskRunState {
 				if sysno, ok := t.image.st.LookupEmulate(addr); ok {
 					return t.doVsyscall(addr, sysno)
 				}
+			}
+
+			// Fixup SIGSEGV err code if necessary; MProtect is capable of unmapping
+			// address ranges from the user process, in which case the initial
+			// signal may very well have appeared as SEGV_MAPERR, but we know better.
+			if sig == linux.SIGSEGV && err == linuxerr.EPERM {
+				info.Code = 2 // SEGV_ACCERR
+			}
+
+			if sig == linux.SIGSEGV && t.tg.sigsegvLockCount.Load() != 0 {
+				t.tg.signalHandlers.mu.Lock()
+				if t.tg.sigsegvLockCount.Load() != 0 {
+					t.Infof("Pausing execution due to SigsegvLock")
+					t.beginInternalStopLocked((*sigsegvLockStop)(nil))
+					t.tg.signalHandlers.mu.Unlock()
+					return (*runApp)(nil)
+				}
+				t.tg.signalHandlers.mu.Unlock()
 			}
 
 			// Faults are common, log only at debug level.

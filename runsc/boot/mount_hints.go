@@ -185,6 +185,12 @@ func (m *MountHint) ShouldShareMount() bool {
 		(m.Share == container || m.Share == pod)
 }
 
+// IsSandboxLocal returns true if this mount is only used by the sandbox and
+// has no external observers.
+func (m *MountHint) IsSandboxLocal() bool {
+	return m.Share == container || m.Share == pod
+}
+
 // checkCompatible verifies that shared mount is compatible with master.
 // Master options must be the same or less restrictive than the container mount,
 // e.g. master can be 'rw' while container mounts as 'ro'.
@@ -200,6 +206,9 @@ func (m *MountHint) checkCompatible(replica *specs.Mount) error {
 	}
 	if masterOpts.Flags.NoATime && !replicaOpts.Flags.NoATime {
 		return fmt.Errorf("cannot mount atime enabled shared mount because master is noatime, mount: %+v", replica)
+	}
+	if masterOpts.Flags.NoSUID && !replicaOpts.Flags.NoSUID {
+		return fmt.Errorf("cannot mount suid enabled shared mount because master is nosuid, mount: %+v", replica)
 	}
 	return nil
 }
@@ -232,6 +241,9 @@ func (p *PodMountHints) FindMount(mountSrc string) *MountHint {
 type RootfsHint struct {
 	Mount   specs.Mount
 	Overlay config.OverlayMedium
+	// Size of overlay tmpfs. Passed as `size={Size}` to tmpfs mount.
+	// Use default if unspecified.
+	Size string
 }
 
 func (r *RootfsHint) setSource(val string) error {
@@ -252,6 +264,30 @@ func (r *RootfsHint) setType(val string) error {
 	return nil
 }
 
+func (r *RootfsHint) setOption(key, val string) error {
+	switch key {
+	case "size":
+		r.Size = val
+	default:
+		return fmt.Errorf("invalid rootfs option: %s=%s", key, val)
+	}
+	return nil
+}
+
+func (r *RootfsHint) setOptions(val string) error {
+	for _, option := range strings.Split(val, ",") {
+		parts := strings.SplitN(option, "=", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("rootfs options must be key=value: %s", option)
+		}
+		key, val := parts[0], parts[1]
+		if err := r.setOption(key, val); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (r *RootfsHint) setField(key, val string) error {
 	switch key {
 	case "source":
@@ -260,6 +296,8 @@ func (r *RootfsHint) setField(key, val string) error {
 		return r.setType(val)
 	case "overlay":
 		return r.Overlay.Set(val)
+	case "options":
+		return r.setOptions(val)
 	default:
 		return fmt.Errorf("invalid rootfs annotation: %s=%s", key, val)
 	}

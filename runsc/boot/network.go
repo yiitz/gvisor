@@ -24,7 +24,6 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/hostos"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
@@ -43,31 +42,29 @@ import (
 	"gvisor.dev/gvisor/runsc/config"
 )
 
-var (
-	// DefaultLoopbackLink contains IP addresses and routes of "127.0.0.1/8" and
-	// "::1/8" on "lo" interface.
-	DefaultLoopbackLink = LoopbackLink{
-		Name: "lo",
-		Addresses: []IPWithPrefix{
-			{Address: net.IP("\x7f\x00\x00\x01"), PrefixLen: 8},
-			{Address: net.IPv6loopback, PrefixLen: 128},
-		},
-		Routes: []Route{
-			{
-				Destination: net.IPNet{
-					IP:   net.IPv4(0x7f, 0, 0, 0),
-					Mask: net.IPv4Mask(0xff, 0, 0, 0),
-				},
-			},
-			{
-				Destination: net.IPNet{
-					IP:   net.IPv6loopback,
-					Mask: net.IPMask(strings.Repeat("\xff", net.IPv6len)),
-				},
+// DefaultLoopbackLink contains IP addresses and routes of "127.0.0.1/8" and
+// "::1/8" on "lo" interface.
+var DefaultLoopbackLink = LoopbackLink{
+	Name: "lo",
+	Addresses: []IPWithPrefix{
+		{Address: net.IP("\x7f\x00\x00\x01"), PrefixLen: 8},
+		{Address: net.IPv6loopback, PrefixLen: 128},
+	},
+	Routes: []Route{
+		{
+			Destination: net.IPNet{
+				IP:   net.IPv4(0x7f, 0, 0, 0),
+				Mask: net.IPv4Mask(0xff, 0, 0, 0),
 			},
 		},
-	}
-)
+		{
+			Destination: net.IPNet{
+				IP:   net.IPv6loopback,
+				Mask: net.IPMask(strings.Repeat("\xff", net.IPv6len)),
+			},
+		},
+	},
+}
 
 // Network exposes methods that can be used to configure a network stack.
 type Network struct {
@@ -83,6 +80,7 @@ type Network struct {
 type Route struct {
 	Destination net.IPNet
 	Gateway     net.IP
+	MTU         uint32
 }
 
 // DefaultRoute represents a catch all route to the default gateway.
@@ -185,9 +183,9 @@ type CreateLinksAndRoutesArgs struct {
 	// ruleset.
 	NATBlob bool
 
-	// DisconnectOk indicates that link endpoints should have the capability
-	// CapabilityDisconnectOk set.
-	DisconnectOk bool
+	// PauseExternalNetworking indicates whether external networking should be
+	// disabled initially.
+	PauseExternalNetworking bool
 }
 
 // InitPluginStackArgs are arguments to InitPluginStack.
@@ -224,6 +222,7 @@ func (r *Route) toTcpipRoute(id tcpip.NICID) (tcpip.Route, error) {
 		Destination: subnet,
 		Gateway:     ipToAddress(r.Gateway),
 		NIC:         id,
+		MTU:         r.MTU,
 	}, nil
 }
 
@@ -324,19 +323,9 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 	fdOffset := 0
 	if len(args.FDBasedLinks) > 0 {
 		// Choose a dispatch mode.
+		// Testing has shown that RecvMMsg is the fastest. Attempts to use
+		// the PacketMMap dispatcher have failed to result in higher throughput.
 		dispatchMode := fdbased.RecvMMsg
-		version, err := hostos.KernelVersion()
-		if err != nil {
-			return err
-		}
-		if version.AtLeast(5, 6) {
-			// TODO(b/333120887): Switch back to using the packet mmap dispatcher when
-			// we have the performance data to justify it.
-			// dispatchMode = fdbased.PacketMMap
-			// log.Infof("Host kernel version >= 5.6, using to packet mmap to dispatch")
-		} else {
-			log.Infof("Host kernel version < 5.6, using to RecvMMsg to dispatch")
-		}
 
 		for _, link := range args.FDBasedLinks {
 			nicID := n.Stack.NextNICID()
@@ -369,7 +358,6 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 				RXChecksumOffload:    link.RXChecksumOffload,
 				GRO:                  link.GVisorGRO,
 				ProcessorsPerChannel: link.ProcessorsPerChannel,
-				DisconnectOk:         args.DisconnectOk,
 			})
 			if err != nil {
 				return err
@@ -463,7 +451,6 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 			InterfaceIndex:    link.InterfaceIndex,
 			Bind:              link.Bind == BindSentry,
 			GRO:               link.GVisorGRO,
-			DisconnectOk:      args.DisconnectOk,
 		})
 		if err != nil {
 			return err
@@ -555,6 +542,10 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 		if err := netfilter.SetEntries(n.Kernel.RootUserNamespace(), n.Stack, iptReplaceBlob, false); err != nil {
 			return fmt.Errorf("failed to SetEntries: %v", err)
 		}
+	}
+
+	if args.PauseExternalNetworking {
+		n.Stack.DisableAllNonLoopbackNICs()
 	}
 
 	return nil

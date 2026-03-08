@@ -46,6 +46,7 @@ var Analyzer = &analysis.Analyzer{
 		(*atomicAlignment)(nil),
 		(*lockGuardFacts)(nil),
 		(*lockFunctionFacts)(nil),
+		(*lockTypeFacts)(nil),
 	},
 }
 
@@ -79,6 +80,7 @@ type passContext struct {
 
 // observationsFor retrieves observations for the given object.
 func (pc *passContext) observationsFor(obj types.Object) *objectObservations {
+	obj = originObject(obj)
 	if pc.observations == nil {
 		pc.observations = make(map[types.Object]*objectObservations)
 	}
@@ -108,7 +110,7 @@ func (pc *passContext) forAllGlobals(fn func(ts *ast.ValueSpec)) {
 }
 
 // forAllTypes applies the given function over all types.
-func (pc *passContext) forAllTypes(fn func(ts *ast.TypeSpec)) {
+func (pc *passContext) forAllTypes(fn func(ts *ast.TypeSpec, decl *ast.GenDecl)) {
 	for _, f := range pc.pass.Files {
 		for _, decl := range f.Decls {
 			d, ok := decl.(*ast.GenDecl)
@@ -116,7 +118,7 @@ func (pc *passContext) forAllTypes(fn func(ts *ast.TypeSpec)) {
 				continue
 			}
 			for _, gs := range d.Specs {
-				fn(gs.(*ast.TypeSpec))
+				fn(gs.(*ast.TypeSpec), d)
 			}
 		}
 	}
@@ -156,15 +158,16 @@ func run(pass *analysis.Pass) (any, error) {
 		}
 		pc.globalLockGuardFacts(vs)
 	})
-	pc.forAllTypes(func(ts *ast.TypeSpec) {
+	pc.forAllTypes(func(ts *ast.TypeSpec, decl *ast.GenDecl) {
 		if ss, ok := ts.Type.(*ast.StructType); ok {
 			structType := pc.pass.TypesInfo.TypeOf(ts.Name).Underlying().(*types.Struct)
 			pc.structLockGuardFacts(structType, ss)
 		}
+		pc.typeAliasFacts(ts, decl)
 	})
 
 	// Check all alignments.
-	pc.forAllTypes(func(ts *ast.TypeSpec) {
+	pc.forAllTypes(func(ts *ast.TypeSpec, _ *ast.GenDecl) {
 		typ, ok := types.Unalias(pass.TypesInfo.TypeOf(ts.Name)).(*types.Named)
 		if !ok {
 			return
@@ -187,11 +190,12 @@ func run(pass *analysis.Pass) (any, error) {
 		// by named functions in the package, and they are analyzing
 		// inline on every call. Thus we skip the analysis here. They
 		// will be hit on calls, or picked up in the pass below.
-		if obj := fn.Object(); obj == nil {
+		obj := fn.Object()
+		if obj == nil {
 			continue
 		}
 		var lff lockFunctionFacts
-		pc.pass.ImportObjectFact(fn.Object(), &lff)
+		pc.importLockFunctionFacts(obj.(*types.Func), &lff)
 
 		// Check the basic blocks in the function.
 		pc.checkFunction(nil, fn, &lff, nil, false /* force */)

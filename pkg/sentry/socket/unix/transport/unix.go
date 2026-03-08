@@ -19,6 +19,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -50,6 +51,16 @@ type RightsControlMessage interface {
 type CredentialsControlMessage interface {
 	// Equals returns true iff the two messages are equal.
 	Equals(CredentialsControlMessage) bool
+}
+
+// A PeerCredentialer is a socket or endpoint that supports the SO_PEERCREDS socket
+// option.
+type PeerCredentialer interface {
+	// PeerCreds returns the peer credentials.
+	PeerCreds() CredentialsControlMessage
+
+	// SetPeerCreds sets the peer credentials.
+	SetPeerCreds(creds CredentialsControlMessage)
 }
 
 // A ControlMessages represents a collection of socket control messages.
@@ -137,20 +148,12 @@ type RecvOutput struct {
 	UnusedRights []RightsControlMessage
 }
 
-// UnixSocketOpts is a container for configuration options for gvisor's management of
-// unix sockets.
-// +stateify savable
-type UnixSocketOpts struct {
-	// If true, the endpoint will be put in a closed state before save; if false, an attempt to save
-	// will throw.
-	DisconnectOnSave bool
-}
-
 // Endpoint is the interface implemented by Unix transport protocol
 // implementations that expose functionality like sendmsg, recvmsg, connect,
 // etc. to Unix socket implementations.
 type Endpoint interface {
 	Credentialer
+	PeerCredentialer
 	waiter.Waitable
 
 	// Close puts the endpoint in a closed state and frees all resources
@@ -178,7 +181,7 @@ type Endpoint interface {
 	// endpoint passed in as a parameter.
 	//
 	// The error codes are the same as Connect.
-	Connect(ctx context.Context, server BoundEndpoint, opts UnixSocketOpts) *syserr.Error
+	Connect(ctx context.Context, server BoundEndpoint) *syserr.Error
 
 	// Shutdown closes the read and/or write end of the endpoint connection
 	// to its peer.
@@ -196,7 +199,7 @@ type Endpoint interface {
 	//
 	// peerAddr if not nil will be populated with the address of the connected
 	// peer on a successful accept.
-	Accept(ctx context.Context, peerAddr *Address, opts UnixSocketOpts) (Endpoint, *syserr.Error)
+	Accept(ctx context.Context, peerAddr *Address) (Endpoint, *syserr.Error)
 
 	// Bind binds the endpoint to a specific local address and port.
 	// Specifying a NIC is optional.
@@ -271,7 +274,7 @@ type BoundEndpoint interface {
 	//
 	// This method will return syserr.ErrConnectionRefused on endpoints with a
 	// type that isn't SockStream or SockSeqpacket.
-	BidirectionalConnect(ctx context.Context, ep ConnectingEndpoint, returnConnect func(Receiver, ConnectedEndpoint), opts UnixSocketOpts) *syserr.Error
+	BidirectionalConnect(ctx context.Context, ep ConnectingEndpoint, returnConnect func(Receiver, ConnectedEndpoint)) *syserr.Error
 
 	// UnidirectionalConnect establishes a write-only connection to a unix
 	// endpoint.
@@ -281,7 +284,7 @@ type BoundEndpoint interface {
 	//
 	// This method will return syserr.ErrConnectionRefused on a non-SockDgram
 	// endpoint.
-	UnidirectionalConnect(ctx context.Context, opts UnixSocketOpts) (ConnectedEndpoint, *syserr.Error)
+	UnidirectionalConnect(ctx context.Context) (ConnectedEndpoint, *syserr.Error)
 
 	// Passcred returns whether or not the SO_PASSCRED socket option is
 	// enabled on this end.
@@ -874,6 +877,11 @@ type baseEndpoint struct {
 
 	// ops is used to get socket level options.
 	ops tcpip.SocketOptions
+
+	// lastError is the last error returned by getsockopt(SO_ERROR).
+	// This field is protected by lastErrorMu.
+	lastErrorMu sync.Mutex `state:"nosave"`
+	lastError   tcpip.Error
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
@@ -932,6 +940,12 @@ func (e *baseEndpoint) RecvMsg(ctx context.Context, data [][]byte, args RecvArgs
 
 	out, notify, err := receiver.Recv(ctx, data, args)
 	if err != nil {
+		// Check if there's a pending error (e.g., ECONNRESET set when listener closed).
+		if err == syserr.ErrClosedForReceive || err == syserr.ErrWouldBlock {
+			if lastErr := e.LastError(); lastErr != nil {
+				return RecvOutput{}, nil, syserr.TranslateNetstackError(lastErr)
+			}
+		}
 		return RecvOutput{}, nil, err
 	}
 
@@ -1019,8 +1033,20 @@ func (e *baseEndpoint) GetSockOpt(opt tcpip.GettableSocketOption) tcpip.Error {
 }
 
 // LastError implements Endpoint.LastError.
-func (*baseEndpoint) LastError() tcpip.Error {
-	return nil
+// It clears and returns the last error.
+func (e *baseEndpoint) LastError() tcpip.Error {
+	e.lastErrorMu.Lock()
+	defer e.lastErrorMu.Unlock()
+	err := e.lastError
+	e.lastError = nil
+	return err
+}
+
+// UpdateLastError implements tcpip.SocketOptionsHandler.UpdateLastError.
+func (e *baseEndpoint) UpdateLastError(err tcpip.Error) {
+	e.lastErrorMu.Lock()
+	e.lastError = err
+	e.lastErrorMu.Unlock()
 }
 
 // SocketOptions implements Endpoint.SocketOptions.

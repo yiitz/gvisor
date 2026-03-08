@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -109,7 +110,7 @@ func NewInotifyFD(ctx context.Context, vfsObj *VirtualFilesystem, flags uint32) 
 		scratch: make([]byte, inotifyEventBaseSize),
 		watches: make(map[int32]*Watch),
 	}
-	if err := fd.vfsfd.Init(fd, flags, vd.Mount(), vd.Dentry(), &FileDescriptionOptions{
+	if err := fd.vfsfd.Init(fd, flags, auth.CredentialsFromContext(ctx), vd.Mount(), vd.Dentry(), &FileDescriptionOptions{
 		UseDentryMetadata: true,
 		DenyPRead:         true,
 		DenyPWrite:        true,
@@ -458,9 +459,7 @@ func (w *Watches) Remove(id uint64) {
 
 	// It is possible for w.Remove() to be called for the same watch multiple
 	// times. See the treatment of one-shot watches in Watches.Notify().
-	if _, ok := w.ws[id]; ok {
-		delete(w.ws, id)
-	}
+	delete(w.ws, id)
 }
 
 // Notify queues a new event with watches in this set. Watches with

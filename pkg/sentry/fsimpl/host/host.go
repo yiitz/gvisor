@@ -33,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/eventfd"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/hostfd"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	unixsocket "gvisor.dev/gvisor/pkg/sentry/socket/unix"
@@ -140,11 +141,6 @@ type inode struct {
 	// This field is initialized at creation time and is immutable.
 	seekable bool
 
-	// isTTY is true if this file represents a TTY.
-	//
-	// This field is initialized at creation time and is immutable.
-	isTTY bool
-
 	// savable is true if hostFD may be saved/restored by its numeric value.
 	//
 	// This field is initialized at creation time and is immutable.
@@ -162,6 +158,9 @@ type inode struct {
 	// This field is initialized at creation time and is immutable.
 	readonly bool
 
+	// devMinor is the immutable minor device number for this inode's filesystem.
+	devMinor uint32
+
 	// Event queue for blocking operations.
 	queue waiter.Queue
 
@@ -176,6 +175,15 @@ type inode struct {
 	bufMu   sync.Mutex `state:"nosave"`
 	haveBuf atomicbitops.Uint32
 	buf     []byte
+
+	// If the inode corresponds to a TTY, tty is the kernel.TTY.
+	//
+	// This pointer is initialized at creation time and is immutable.
+	tty *kernel.TTY
+	// If the inode corresponds to a TTY, termios is the cached termios
+	// struct. It is protected by termiosMu.
+	termiosMu sync.Mutex `state:"nosave"`
+	termios   linux.KernelTermios
 }
 
 func newInode(ctx context.Context, fs *filesystem, hostFD int, savable bool, restoreKey vfs.RestoreID, fileType linux.FileMode, isTTY bool, readonly bool) (*inode, error) {
@@ -193,13 +201,21 @@ func newInode(ctx context.Context, fs *filesystem, hostFD int, savable bool, res
 		hostFD:     hostFD,
 		ino:        fs.NextIno(),
 		ftype:      uint16(fileType),
+		devMinor:   fs.devMinor,
 		epollable:  isEpollable(hostFD),
 		seekable:   seekable,
-		isTTY:      isTTY,
 		savable:    savable,
 		restoreKey: restoreKey,
 		readonly:   readonly,
 	}
+
+	if isTTY {
+		// Allocate a new TTY for this inode. TTY number does not
+		// matter, since this inode is not reachable via devpts.
+		i.tty = kernel.NewTTY(0, i)
+		i.termios = linux.DefaultReplicaTermios
+	}
+
 	i.InitRefs()
 	i.CachedMappable.Init(hostFD)
 
@@ -420,8 +436,6 @@ func (i *inode) Stat(ctx context.Context, vfsfs *vfs.Filesystem, opts vfs.StatOp
 		return linux.Statx{}, linuxerr.EINVAL
 	}
 
-	fs := vfsfs.Impl().(*filesystem)
-
 	// Limit our host call only to known flags.
 	mask := opts.Mask & linux.STATX_ALL
 	var s unix.Statx_t
@@ -430,7 +444,7 @@ func (i *inode) Stat(ctx context.Context, vfsfs *vfs.Filesystem, opts vfs.StatOp
 		// Fallback to fstat(2), if statx(2) is not supported on the host.
 		//
 		// TODO(b/151263641): Remove fallback.
-		return i.statxFromStat(fs)
+		return i.statxFromStat(i.devMinor)
 	}
 	if err != nil {
 		return linux.Statx{}, err
@@ -446,7 +460,7 @@ func (i *inode) Stat(ctx context.Context, vfsfs *vfs.Filesystem, opts vfs.StatOp
 		Ino:            i.ino,
 		AttributesMask: s.Attributes_mask,
 		DevMajor:       linux.UNNAMED_MAJOR,
-		DevMinor:       fs.devMinor,
+		DevMinor:       i.devMinor,
 	}
 
 	// Copy other fields that were returned by the host. RdevMajor/RdevMinor
@@ -514,7 +528,7 @@ func (i *inode) Stat(ctx context.Context, vfsfs *vfs.Filesystem, opts vfs.StatOp
 // of a mask or sync flags. fstat(2) does not provide any metadata
 // equivalent to Statx.Attributes, Statx.AttributesMask, or Statx.Btime, so
 // those fields remain empty.
-func (i *inode) statxFromStat(fs *filesystem) (linux.Statx, error) {
+func (i *inode) statxFromStat(devMinor uint32) (linux.Statx, error) {
 	var s unix.Stat_t
 	if err := i.stat(&s); err != nil {
 		return linux.Statx{}, err
@@ -536,7 +550,7 @@ func (i *inode) statxFromStat(fs *filesystem) (linux.Statx, error) {
 		Ctime:    timespecToStatxTimestamp(s.Ctim),
 		Mtime:    timespecToStatxTimestamp(s.Mtim),
 		DevMajor: linux.UNNAMED_MAJOR,
-		DevMinor: fs.devMinor,
+		DevMinor: devMinor,
 	}, nil
 }
 
@@ -666,15 +680,16 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 	return i.open(ctx, d, rp.Mount(), fileType, opts.Flags)
 }
 
-func (i *inode) open(ctx context.Context, d *kernfs.Dentry, mnt *vfs.Mount, fileType linux.FileMode, flags uint32) (*vfs.FileDescription, error) {
-	// Constrain flags to a subset we can handle.
-	//
-	// TODO(gvisor.dev/issue/2601): Support O_NONBLOCK by adding RWF_NOWAIT to pread/pwrite calls.
-	flags &= unix.O_ACCMODE | unix.O_NONBLOCK | unix.O_DSYNC | unix.O_SYNC | unix.O_APPEND
+// Supported flags for Open.
+//
+// TODO(gvisor.dev/issue/2601): Support O_NONBLOCK by adding RWF_NOWAIT to pread/pwrite calls.
+const supportedOpenFlags = unix.O_ACCMODE | unix.O_NONBLOCK | unix.O_DSYNC | unix.O_SYNC | unix.O_APPEND
 
+func (i *inode) open(ctx context.Context, d *kernfs.Dentry, mnt *vfs.Mount, fileType linux.FileMode, flags uint32) (*vfs.FileDescription, error) {
+	flags &= supportedOpenFlags
 	switch fileType {
 	case unix.S_IFSOCK:
-		if i.isTTY {
+		if i.tty != nil {
 			log.Warningf("cannot use host socket fd %d as TTY", i.hostFD)
 			return nil, linuxerr.ENOTTY
 		}
@@ -684,23 +699,17 @@ func (i *inode) open(ctx context.Context, d *kernfs.Dentry, mnt *vfs.Mount, file
 			return nil, err
 		}
 		// Currently, we only allow Unix sockets to be imported.
-		return unixsocket.NewFileDescription(ep, ep.Type(), flags, nil, mnt, d.VFSDentry(), &i.locks)
+		return unixsocket.NewFileDescription(ep, ep.Type(), flags, nil, mnt, d.VFSDentry(), &i.locks, auth.CredentialsFromContext(ctx))
 
 	case unix.S_IFREG, unix.S_IFIFO, unix.S_IFCHR:
-		if i.isTTY {
-			fd := NewTTYFileDescription(i)
-			fd.LockFD.Init(&i.locks)
-			vfsfd := &fd.vfsfd
-			if err := vfsfd.Init(fd, flags, mnt, d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
-				return nil, err
-			}
-			return vfsfd, nil
+		if i.tty != nil {
+			return i.OpenTTY(ctx, mnt, d.VFSDentry(), vfs.OpenOptions{Flags: flags})
 		}
 
 		fd := &fileDescription{inode: i}
 		fd.LockFD.Init(&i.locks)
 		vfsfd := &fd.vfsfd
-		if err := vfsfd.Init(fd, flags, mnt, d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
+		if err := vfsfd.Init(fd, flags, auth.CredentialsFromContext(ctx), mnt, d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
 			return nil, err
 		}
 		return vfsfd, nil
@@ -709,6 +718,24 @@ func (i *inode) open(ctx context.Context, d *kernfs.Dentry, mnt *vfs.Mount, file
 		log.Warningf("cannot import host fd %d with file type %o", i.hostFD, fileType)
 		return nil, linuxerr.EPERM
 	}
+}
+
+// OpenTTY implements kernel.TTYOperations.OpenTTY.
+func (i *inode) OpenTTY(ctx context.Context, mnt *vfs.Mount, d *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	if i.tty == nil {
+		panic("OpenTTY called on non-TTY host inode")
+	}
+
+	flags := opts.Flags & supportedOpenFlags
+	fd := &TTYFileDescription{
+		fileDescription: fileDescription{inode: i},
+	}
+	fd.LockFD.Init(&i.locks)
+	vfsfd := &fd.vfsfd
+	if err := vfsfd.Init(fd, flags, auth.CredentialsFromContext(ctx), mnt, d, &vfs.FileDescriptionOptions{}); err != nil {
+		return nil, err
+	}
+	return vfsfd, nil
 }
 
 // Create a new host-backed endpoint from the given fd and its corresponding

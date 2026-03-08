@@ -1,7 +1,8 @@
 // Copyright 2022 The gVisor Authors.
 //
 // Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd.
 
 package hostarch
 
@@ -110,4 +111,14 @@ func CacheLineRoundUp[T bytecount](x T) (val T, ok bool) {
 	val = CacheLineRoundDown(x + CacheLineMask)
 	ok = val >= x
 	return
+}
+
+// MustCacheLineRoundUp is equivalent to CacheLineRoundUp, but panics if
+// rounding up overflows.
+func MustCacheLineRoundUp[T bytecount](x T) T {
+	val, ok := CacheLineRoundUp(x)
+	if !ok {
+		panic("CacheLineRoundUp overflows")
+	}
+	return val
 }

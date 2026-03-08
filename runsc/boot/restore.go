@@ -17,6 +17,7 @@ package boot
 import (
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	time2 "time"
 
@@ -28,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -40,22 +42,15 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/timing"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
+	"gvisor.dev/gvisor/runsc/starttime"
 	"gvisor.dev/gvisor/runsc/version"
 )
 
 const (
-	// CheckpointStateFileName is the file within the given image-path's
-	// directory which contains the container's saved state.
-	CheckpointStateFileName = "checkpoint.img"
-	// CheckpointPagesMetadataFileName is the file within the given image-path's
-	// directory containing the container's MemoryFile metadata.
-	CheckpointPagesMetadataFileName = "pages_meta.img"
-	// CheckpointPagesFileName is the file within the given image-path's
-	// directory containing the container's MemoryFile pages.
-	CheckpointPagesFileName = "pages.img"
 	// VersionKey is the key used to save runsc version in the save metadata and compare
 	// it across checkpoint restore.
 	VersionKey = "runsc_version"
@@ -80,10 +75,15 @@ type restorer struct {
 	// containers is the list of containers restored so far.
 	containers []*containerInfo
 
-	// Files used by restore to rehydrate the state.
-	stateFile     *fd.FD
-	pagesMetadata *fd.FD
-	pagesFile     *fd.FD
+	// stateFile is a reader for the statefile.
+	stateFile io.ReadCloser
+
+	// metadata is the metadata contained in the statefile.
+	metadata map[string]string
+
+	// timer is the timer for the restore process.
+	// The `restorer` owns the timer and will end it when restore is complete.
+	timer *timing.Timer
 
 	// If background is true, pagesFile may continue to be read after
 	// restorer.restore() returns.
@@ -95,22 +95,25 @@ type restorer struct {
 	// kernel object is created.
 	mainMF *pgalloc.MemoryFile
 
-	// pagesFileLoader is used to load the MemoryFile pages. It handles the
-	// possibly-asynchronous loading of the memory pages.
-	pagesFileLoader kernel.PagesFileLoader
+	// asyncMFLoader is used to load the MemoryFile pages. It handles the
+	// asynchronous loading of the memory pages.
+	asyncMFLoader *kernel.AsyncMFLoader
 
 	// deviceFile is the required to start the platform.
 	deviceFile *fd.FD
 
-	// restoreDone is a callback triggered when restore is successful.
-	restoreDone func() error
+	// cm is the container manager that is used to restore the sandbox.
+	cm *containerManager
 
 	// checkpointedSpecs contains the map of container specs used during
 	// checkpoint.
 	checkpointedSpecs map[string]*specs.Spec
 }
 
-func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l *Loader, cid string, stdioFDs, goferFDs, goferFilestoreFDs []*fd.FD, devGoferFD *fd.FD, goferMountConfs []GoferMountConf) error {
+// restoreSubcontainer restores a subcontainer.
+// `subcontainerTimeline` must either be nil or an orphaned timeline.
+// It takes ownership of subcontainerTimeline and will end it.
+func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l *Loader, cid string, stdioFDs, goferFDs, goferFilestoreFDs []*fd.FD, devGoferFD *fd.FD, goferMountConfs []GoferMountConf, subcontainerTimeline *timing.Timeline) error {
 	containerName := l.registerContainer(spec, cid)
 	info := &containerInfo{
 		cid:               cid,
@@ -123,12 +126,18 @@ func (r *restorer) restoreSubcontainer(spec *specs.Spec, conf *config.Config, l 
 		goferFilestoreFDs: goferFilestoreFDs,
 		goferMountConfs:   goferMountConfs,
 	}
-	return r.restoreContainerInfo(l, info)
+	r.timer.Adopt(subcontainerTimeline)
+	return r.restoreContainerInfo(l, info, subcontainerTimeline)
 }
 
-func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
+// restoreContainerInfo restores a container.
+// It takes ownership of containerTimeline and will end it.
+func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo, containerTimeline *timing.Timeline) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	containerTiming := containerTimeline.Lease()
+	defer containerTiming.End()
+	containerTiming.Reached("restorer locked")
 
 	for _, container := range r.containers {
 		if container.containerName == info.containerName {
@@ -141,50 +150,22 @@ func (r *restorer) restoreContainerInfo(l *Loader, info *containerInfo) error {
 
 	r.containers = append(r.containers, info)
 
-	log.Infof("Restored container %d of %d", len(r.containers), r.totalContainers)
 	if log.IsLogging(log.Debug) {
 		for i, fd := range info.stdioFDs {
 			log.Debugf("Restore app FD: %d host FD: %d", i, fd.FD())
 		}
 	}
-	if err := r.maybeKickoffMainMemoryFileLoad(l); err != nil {
-		return fmt.Errorf("main memory file: %w", err)
-	}
+	containerTiming.End()
+	log.Infof("Restored container %d of %d", len(r.containers), r.totalContainers)
+
+	// Non-container-specific restore work:
 
 	if len(r.containers) == r.totalContainers {
-		if err := specutils.RestoreValidateSpec(r.checkpointedSpecs, l.GetContainerSpecs(), l.root.conf); err != nil {
-			return fmt.Errorf("failed to handle restore spec validation: %w", err)
-		}
-
 		// Trigger the restore if this is the last container.
-		return r.restore(l)
-	}
-	return nil
-}
-
-// maybeKickoffMainMemoryFileLoad kicks off loading of the main MemoryFile
-// asynchronously, if possible and if it hasn't been done yet.
-func (r *restorer) maybeKickoffMainMemoryFileLoad(l *Loader) error {
-	if r.mainMF == nil {
-		// Create the main MemoryFile.
-		mf, err := createMemoryFile(l.root.conf.AppHugePages, l.hostTHP)
-		if err != nil {
-			return fmt.Errorf("creating memory file: %v", err)
+		if err := r.restore(l); err != nil {
+			return err
 		}
-		r.mainMF = mf
 	}
-	if r.pagesFileLoader != nil {
-		return nil // Already kicked off.
-	}
-	if r.pagesFile == nil || r.pagesMetadata == nil {
-		return nil // Asynchronous loading not possible.
-	}
-	r.pagesFileLoader = kernel.NewSeparatePagesFileLoader(r.pagesMetadata, r.pagesFile, r.mainMF)
-
-	// Ownership transferred to the pages file loader.
-	r.pagesFile = nil
-	r.pagesMetadata = nil
-
 	return nil
 }
 
@@ -200,16 +181,24 @@ func createNetworkStackForRestore(l *Loader) (*stack.Stack, inet.Stack) {
 func (r *restorer) restore(l *Loader) error {
 	log.Infof("Starting to restore %d containers", len(r.containers))
 
+	// Validate the container specs to ensure they did not meaningfully change
+	// between checkpoint and restore.
+	if err := specutils.RestoreValidateSpec(r.checkpointedSpecs, l.GetContainerSpecs(), l.root.conf); err != nil {
+		return fmt.Errorf("failed to handle restore spec validation: %w", err)
+	}
+	r.timer.Reached("specs validated")
+
 	// Create a new root network namespace with the network stack of the
 	// old kernel to preserve the existing network configuration.
 	oldStack, oldInetStack := createNetworkStackForRestore(l)
+	r.timer.Reached("netstack created")
 
 	// Reset the network stack in the network namespace to nil before
 	// replacing the kernel. This will not free the network stack when this
 	// old kernel is released.
 	l.k.RootNetworkNamespace().ResetStack()
 
-	p, err := createPlatform(l.root.conf, r.deviceFile)
+	p, err := createPlatform(l.root.conf, l.root.applicationCores, r.deviceFile)
 	if err != nil {
 		return fmt.Errorf("creating platform: %v", err)
 	}
@@ -218,7 +207,9 @@ func (r *restorer) restore(l *Loader) error {
 	l.watchdog.Start()
 
 	// Release the kernel and replace it with a new one that will be restored into.
+	var oldNvidiaDriverVersion nvconf.DriverVersion
 	if l.k != nil {
+		oldNvidiaDriverVersion = l.k.NvidiaDriverVersion
 		l.k.Release()
 	}
 	l.k = &kernel.Kernel{
@@ -275,20 +266,46 @@ func (r *restorer) restore(l *Loader) error {
 	ctx = context.WithValue(ctx, pgalloc.CtxMemoryFileMap, mfmap)
 	ctx = context.WithValue(ctx, devutil.CtxDevGoferClientProvider, l.k)
 
-	// Load the state.
-	loadOpts := state.LoadOpts{
-		Source:          r.stateFile,
-		PagesFileLoader: r.pagesFileLoader,
-		Background:      r.background,
+	if r.asyncMFLoader != nil {
+		// Now that private memory files are known, kick off their loading in the
+		// background goroutine.
+		r.asyncMFLoader.KickoffPrivate(mfmap)
 	}
-	err = loadOpts.Load(ctx, l.k, nil, oldInetStack, time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}, l.saveRestoreNet)
+
+	ctx, err = r.prepareRestoreContextExtraLocked(ctx, l)
 	if err != nil {
+		return err
+	}
+
+	// Load the state.
+	r.timer.Reached("loading kernel")
+	if err := l.k.LoadFrom(ctx, r.stateFile, r.asyncMFLoader, nil, oldInetStack, time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}, l.saveRestoreNet); err != nil {
 		return fmt.Errorf("failed to load kernel: %w", err)
+	}
+	r.timer.Reached("kernel loaded")
+	if oldNvidiaDriverVersion.Major() > 0 && !l.k.NvidiaDriverVersion.Equals(oldNvidiaDriverVersion) {
+		return fmt.Errorf("nvidia driver version changed during restore: was %v, now %v", oldNvidiaDriverVersion, l.k.NvidiaDriverVersion)
+	}
+
+	if r.asyncMFLoader != nil {
+		if r.background {
+			if err := r.asyncMFLoader.WaitMetadata(); err != nil {
+				return err
+			}
+			r.timer.Reached("MF metadata loaded")
+		} else {
+			if err := r.asyncMFLoader.Wait(); err != nil {
+				return err
+			}
+			r.timer.Reached("MFs loaded")
+		}
 	}
 
 	// Since we have a new kernel we also must make a new watchdog.
 	dogOpts := watchdog.DefaultOpts
-	dogOpts.TaskTimeoutAction = l.root.conf.WatchdogAction
+	if err := dogOpts.TaskTimeoutAction.Set(l.root.conf.WatchdogAction); err != nil {
+		return fmt.Errorf("setting watchdog action: %w", err)
+	}
 	dogOpts.StartupTimeout = 3 * time2.Minute // Give extra time for all containers to restore.
 	dog := watchdog.New(l.k, dogOpts)
 
@@ -296,7 +313,6 @@ func (r *restorer) restore(l *Loader) error {
 	l.watchdog.Stop()
 	l.watchdog = dog
 	l.root.procArgs = kernel.CreateProcessArgs{}
-	l.restore = true
 	l.sandboxID = l.root.cid
 
 	// Update all tasks in the system with their respective new container IDs.
@@ -338,7 +354,7 @@ func (r *restorer) restore(l *Loader) error {
 
 	l.k.RestoreContainerMapping(l.containerIDs)
 
-	l.kernelInitExtra()
+	l.kernelInitExtra(ctx)
 
 	// Refresh the control server with the newly created kernel.
 	l.ctrl.refreshHandlers()
@@ -346,31 +362,108 @@ func (r *restorer) restore(l *Loader) error {
 	// Release `l.mu` before calling into callbacks.
 	cu.Clean()
 
-	// r.restoreDone() signals and waits for the sandbox to start.
-	if err := r.restoreDone(); err != nil {
-		return fmt.Errorf("restorer.restoreDone callback failed: %w", err)
+	r.timer.Reached("Starting sandbox")
+	if err := r.cm.onStart(); err != nil {
+		return fmt.Errorf("restorer.readyToStart callback failed: %w", err)
 	}
 
 	r.stateFile.Close()
 
+	postRestoreThread := r.timer.Fork("postRestore")
 	go func() {
-		if err := postRestoreImpl(l); err != nil {
+		defer postRestoreThread.End()
+		postRestoreThread.Reached("scheduled")
+		if err := control.PostRestore(l.k, postRestoreThread); err != nil {
 			log.Warningf("Killing the sandbox after post restore work failed: %v", err)
 			l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
 			return
 		}
+		postRestoreThread.Reached("post restore done")
 
-		// Restore was successful, so increment the checkpoint count manually. The
-		// count was saved while the previous kernel was being saved and checkpoint
-		// success was unknown at that time. Now we know the checkpoint succeeded.
-		l.k.OnRestoreDone()
+		// Now that post restore work succeeded, increment the checkpoint gen
+		// manually. The count was saved while the previous kernel was being saved
+		// and checkpoint success was unknown at that time. Now we know the had
+		// checkpoint succeeded. Allow the application to proceed while pages may
+		// keep loading in the background.
+		l.k.IncCheckpointGenOnRestore()
+
+		// Wait for page loading to complete if happening in the background.
+		if r.asyncMFLoader != nil {
+			if err := r.asyncMFLoader.Wait(); err != nil {
+				log.Warningf("Killing the sandbox after MemoryFile page loading failed: %v", err)
+				l.k.Kill(linux.WaitStatusTerminationSignal(linux.SIGKILL))
+				return
+			}
+		}
+
+		// Calculate the CPU time saved for restore.
+		t, err := state.CPUTime()
+		var s Savings
+		if err != nil {
+			log.Warningf("Failed to get CPU time usage for restore, err: %v", err)
+		} else {
+			log.Infof("Restore CPU usage: %s", t.String())
+			savedTimeStr, ok := r.metadata[state.GvisorCPUUsageKey]
+			if !ok {
+				log.Warningf("Failed to retrieve CPU time usage from the metadata")
+			} else {
+				savedTime, err := time2.ParseDuration(savedTimeStr)
+				if err != nil {
+					log.Warningf("CPU time usage in metadata %v is invalid, err: %v", savedTimeStr, err)
+				} else {
+					s.CPUTimeSaved = savedTime - t
+					log.Infof("CPU time saved with restore: %v ms", s.CPUTimeSaved.Milliseconds())
+				}
+			}
+		}
+
+		// Calculate the walltime saved for restore.
+		startTime := starttime.Get()
+		curTime := time2.Now()
+		wt := curTime.Sub(startTime)
+		log.Infof("Restore wall time: %s", wt.String())
+		savedWtStr, ok := r.metadata[state.GvisorWallTimeKey]
+		if !ok {
+			log.Warningf("Failed to retrieve walltime from the metadata")
+		} else {
+			savedWt, err := time2.ParseDuration(savedWtStr)
+			if err != nil {
+				log.Warningf("Walltime in metadata %v is invalid, err: %v", savedWtStr, err)
+			} else {
+				s.WallTimeSaved = savedWt - wt
+				log.Infof("Walltime saved with restore: %v ms", s.WallTimeSaved.Milliseconds())
+			}
+		}
+
+		r.cm.onRestoreDone(s)
+		postRestoreThread.Reached("kernel notified")
 
 		log.Infof("Restore successful")
 	}()
+
+	// Transfer ownership of the `timer` to a new goroutine.
+	// This is because `timer.Log` blocks until all timed tasks are finished,
+	// but some restore tasks may still run in the background, and we don't
+	// want to block this function until they finish.
+	timer := r.timer
+	r.timer = nil
+	go timer.Log()
+
 	return nil
 }
 
 func (l *Loader) save(o *control.SaveOpts) (err error) {
+	saveOpts, err := control.ConvertToStateSaveOpts(o)
+	if err != nil {
+		return err
+	}
+	defer saveOpts.Close()
+
+	return l.saveWithOpts(saveOpts, &o.ExecOpts)
+}
+
+// saveWithOpts saves the kernel with the given options.
+func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *control.SaveRestoreExecOpts) (err error) {
 	defer func() {
 		// This closure is required to capture the final value of err.
 		l.k.OnCheckpointAttempt(err)
@@ -381,22 +474,25 @@ func (l *Loader) save(o *control.SaveOpts) (err error) {
 		return errors.New("checkpoint not supported when using hostinet")
 	}
 
-	if o.Metadata == nil {
-		o.Metadata = make(map[string]string)
+	if saveOpts.Metadata == nil {
+		saveOpts.Metadata = make(map[string]string)
 	}
-	o.Metadata[ContainerCountKey] = strconv.Itoa(l.containerCount())
+	saveOpts.Metadata[ContainerCountKey] = strconv.Itoa(l.containerCount())
 
 	// Save runsc version.
-	o.Metadata[VersionKey] = version.Version()
+	saveOpts.Metadata[VersionKey] = version.Version()
 
 	// Save container specs.
 	specsStr, err := specutils.ConvertSpecsToString(l.GetContainerSpecs())
 	if err != nil {
 		return err
 	}
-	o.Metadata[ContainerSpecsKey] = specsStr
+	saveOpts.Metadata[ContainerSpecsKey] = specsStr
 
-	if err := preSaveImpl(l, o); err != nil {
+	// Save start time of the runsc process.
+	saveOpts.StartTime = starttime.Get()
+
+	if err := l.prepareSaveOptsExtra(saveOpts); err != nil {
 		return err
 	}
 
@@ -404,14 +500,5 @@ func (l *Loader) save(o *control.SaveOpts) (err error) {
 		Kernel:   l.k,
 		Watchdog: l.watchdog,
 	}
-	if err := state.Save(o, nil); err != nil {
-		return err
-	}
-
-	if o.Resume {
-		if err := postResumeImpl(l); err != nil {
-			return err
-		}
-	}
-	return nil
+	return state.SaveWithOpts(saveOpts, execOpts)
 }

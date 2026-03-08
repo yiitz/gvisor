@@ -15,6 +15,10 @@
 package transport
 
 import (
+	"fmt"
+	"runtime"
+	"strings"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/syserr"
@@ -30,6 +34,8 @@ import (
 // +stateify savable
 type connectionlessEndpoint struct {
 	baseEndpoint
+	closerStack    [32]uintptr
+	closerStackLen int
 }
 
 var (
@@ -39,7 +45,7 @@ var (
 
 // NewConnectionless creates a new unbound dgram endpoint.
 func NewConnectionless(ctx context.Context) Endpoint {
-	ep := &connectionlessEndpoint{baseEndpoint{Queue: &waiter.Queue{}}}
+	ep := &connectionlessEndpoint{baseEndpoint: baseEndpoint{Queue: &waiter.Queue{}}}
 	q := queue{ReaderQueue: ep.Queue, WriterQueue: &waiter.Queue{}, limit: defaultBufferSize}
 	q.InitRefs()
 	ep.receiver = &queueReceiver{readQueue: &q}
@@ -67,6 +73,7 @@ func (e *connectionlessEndpoint) Close(ctx context.Context) {
 
 	e.receiver.CloseRecv()
 	r := e.receiver
+	e.closerStackLen = runtime.Callers(0, e.closerStack[:])
 	e.receiver = nil
 	e.Unlock()
 
@@ -78,12 +85,12 @@ func (e *connectionlessEndpoint) Close(ctx context.Context) {
 }
 
 // BidirectionalConnect implements BoundEndpoint.BidirectionalConnect.
-func (e *connectionlessEndpoint) BidirectionalConnect(ctx context.Context, ce ConnectingEndpoint, returnConnect func(Receiver, ConnectedEndpoint), opts UnixSocketOpts) *syserr.Error {
+func (e *connectionlessEndpoint) BidirectionalConnect(ctx context.Context, ce ConnectingEndpoint, returnConnect func(Receiver, ConnectedEndpoint)) *syserr.Error {
 	return syserr.ErrConnectionRefused
 }
 
 // UnidirectionalConnect implements BoundEndpoint.UnidirectionalConnect.
-func (e *connectionlessEndpoint) UnidirectionalConnect(ctx context.Context, opts UnixSocketOpts) (ConnectedEndpoint, *syserr.Error) {
+func (e *connectionlessEndpoint) UnidirectionalConnect(ctx context.Context) (ConnectedEndpoint, *syserr.Error) {
 	e.Lock()
 	r := e.receiver
 	e.Unlock()
@@ -107,8 +114,7 @@ func (e *connectionlessEndpoint) SendMsg(ctx context.Context, data [][]byte, c C
 		return e.baseEndpoint.SendMsg(ctx, data, c, nil)
 	}
 
-	opts := UnixSocketOpts{}
-	connected, err := to.UnidirectionalConnect(ctx, opts)
+	connected, err := to.UnidirectionalConnect(ctx)
 	if err != nil {
 		return 0, nil, syserr.ErrInvalidEndpointState
 	}
@@ -132,8 +138,8 @@ func (e *connectionlessEndpoint) Type() linux.SockType {
 }
 
 // Connect attempts to connect directly to server.
-func (e *connectionlessEndpoint) Connect(ctx context.Context, server BoundEndpoint, opts UnixSocketOpts) *syserr.Error {
-	connected, err := server.UnidirectionalConnect(ctx, opts)
+func (e *connectionlessEndpoint) Connect(ctx context.Context, server BoundEndpoint) *syserr.Error {
+	connected, err := server.UnidirectionalConnect(ctx)
 	if err != nil {
 		return err
 	}
@@ -154,8 +160,16 @@ func (*connectionlessEndpoint) Listen(context.Context, int) *syserr.Error {
 }
 
 // Accept accepts a new connection.
-func (*connectionlessEndpoint) Accept(context.Context, *Address, UnixSocketOpts) (Endpoint, *syserr.Error) {
+func (*connectionlessEndpoint) Accept(context.Context, *Address) (Endpoint, *syserr.Error) {
 	return nil, syserr.ErrNotSupported
+}
+
+func (e *connectionlessEndpoint) PeerCreds() CredentialsControlMessage {
+	return nil
+}
+
+func (e *connectionlessEndpoint) SetPeerCreds(creds CredentialsControlMessage) {
+	// no-op
 }
 
 // Bind binds the connection.
@@ -188,6 +202,21 @@ func (e *connectionlessEndpoint) Readiness(mask waiter.EventMask) waiter.EventMa
 	e.Lock()
 	defer e.Unlock()
 
+	if e.receiver == nil {
+		if e.closerStackLen == 0 {
+			panic("connectionlessEndpoint.Readiness called with receiver=nil; no closer stack available")
+		}
+		frames := runtime.CallersFrames(e.closerStack[:e.closerStackLen])
+		var b strings.Builder
+		for {
+			frame, more := frames.Next()
+			fmt.Fprintf(&b, "%s\n\t%s:%d pc=%#x\n", frame.Function, frame.File, frame.Line, frame.PC)
+			if !more {
+				break
+			}
+		}
+		panic(fmt.Sprintf("connectionlessEndpoint.Readiness called with receiver=nil; closer:\n%s", b.String()))
+	}
 	ready := waiter.EventMask(0)
 	if mask&waiter.ReadableEvents != 0 && e.receiver.Readable() {
 		ready |= waiter.ReadableEvents

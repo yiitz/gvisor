@@ -45,6 +45,8 @@
 package ptrace
 
 import (
+	"math"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fd"
@@ -72,6 +74,7 @@ var (
 
 type context struct {
 	archContext
+	platform.NoCPUNumbers
 
 	// signalInfo is the signal info, if and when a signal is received.
 	signalInfo linux.SignalInfo
@@ -108,7 +111,10 @@ func (c *context) Switch(ctx pkgcontext.Context, mm platform.MemoryManager, ac *
 	as := mm.AddressSpace()
 	s := as.(*subprocess)
 restart:
-	isSyscall := s.switchToApp(c, ac)
+	isSyscall, err := s.switchToApp(c, ac)
+	if err != nil {
+		return nil, hostarch.NoAccess, err
+	}
 
 	var (
 		faultSP   *subprocess
@@ -189,6 +195,9 @@ func (c *context) Interrupt() {
 	c.interrupt.NotifyInterrupt()
 }
 
+// Preempt implements platform.Context.Preempt.
+func (c *context) Preempt() {}
+
 // Release implements platform.Context.Release().
 func (c *context) Release() {}
 
@@ -201,11 +210,25 @@ func (c *context) PullFullState(as platform.AddressSpace, ac *arch.Context64) er
 // PrepareSleep implements platform.Context.platform.PrepareSleep.
 func (*context) PrepareSleep() {}
 
+// PrepareUninterruptibleSleep implements
+// platform.Context.platform.PrepareUninterruptibleSleep.
+func (*context) PrepareUninterruptibleSleep() {}
+
+// PrepareStop implements platform.Context.PrepareStop.
+func (*context) PrepareStop() {}
+
+// PrepareExecve implements platform.Context.PrepareExecve.
+func (*context) PrepareExecve() {}
+
+// PrepareExit implements platform.Context.PrepareExit.
+func (*context) PrepareExit() {}
+
 // PTrace represents a collection of ptrace subprocesses.
 type PTrace struct {
 	platform.MMapMinAddr
 	platform.NoCPUPreemptionDetection
 	platform.UseHostGlobalMemoryBarrier
+	platform.NoCPUNumbers
 }
 
 // New returns a new ptrace-based implementation of the platform interface.
@@ -234,11 +257,6 @@ func (*PTrace) SupportsAddressSpaceIO() bool {
 	return false
 }
 
-// CooperativelySchedulesAddressSpace implements platform.Platform.CooperativelySchedulesAddressSpace.
-func (*PTrace) CooperativelySchedulesAddressSpace() bool {
-	return false
-}
-
 // MapUnit implements platform.Platform.MapUnit.
 func (*PTrace) MapUnit() uint64 {
 	// The host kernel manages page tables and arbitrary-sized mappings
@@ -253,14 +271,18 @@ func (*PTrace) MaxUserAddress() hostarch.Addr {
 }
 
 // NewAddressSpace returns a new subprocess.
-func (p *PTrace) NewAddressSpace(any) (platform.AddressSpace, <-chan struct{}, error) {
-	as, err := newSubprocess(globalPool.master.createStub)
-	return as, nil, err
+func (p *PTrace) NewAddressSpace() (platform.AddressSpace, error) {
+	return newSubprocess(globalPool.master.createStub)
+}
+
+// ConcurrencyCount implements platform.Platform.ConcurrencyCount.
+func (*PTrace) ConcurrencyCount() int {
+	return math.MaxInt
 }
 
 type constructor struct{}
 
-func (*constructor) New(*fd.FD) (platform.Platform, error) {
+func (*constructor) New(platform.Options) (platform.Platform, error) {
 	return New()
 }
 

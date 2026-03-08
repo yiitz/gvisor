@@ -21,12 +21,12 @@ import (
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/state"
+	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
 	"gvisor.dev/gvisor/pkg/sentry/strace"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/runsc/specutils"
-	"gvisor.dev/gvisor/runsc/version"
 )
 
 func getTargetForSaveResume(l *Loader) func(k *kernel.Kernel) {
@@ -39,14 +39,9 @@ func getTargetForSaveResume(l *Loader) func(k *kernel.Kernel) {
 			Autosave:    true,
 			Resume:      true,
 			Destination: &buf,
-			Metadata:    map[string]string{VersionKey: version.Version()},
 		}
-		specsStr, err := specutils.ConvertSpecsToString(l.GetContainerSpecs())
-		if err != nil {
-			panic(fmt.Sprintf("error to get container specs from metadata, %v", err))
-		}
-		saveOpts.Metadata[ContainerSpecsKey] = specsStr
-		saveOpts.Save(k.SupervisorContext(), k, l.watchdog)
+		defer saveOpts.Close()
+		l.saveWithOpts(&saveOpts, &control.SaveRestoreExecOpts{})
 	}
 }
 
@@ -62,18 +57,13 @@ func getTargetForSaveRestore(l *Loader, files []*fd.FD) func(k *kernel.Kernel) {
 				Autosave:    true,
 				Resume:      false,
 				Destination: files[0],
-				Metadata:    map[string]string{VersionKey: version.Version()},
 			}
 			if len(files) == 3 {
-				saveOpts.PagesMetadata = files[1]
-				saveOpts.PagesFile = files[2]
+				saveOpts.PagesMetadata = stateio.NewBufioWriteCloser(files[1])
+				saveOpts.PagesFile = stateio.NewPagesFileFDWriterDefault(int32(files[2].Release()))
 			}
-			specsStr, err := specutils.ConvertSpecsToString(l.GetContainerSpecs())
-			if err != nil {
-				panic(fmt.Sprintf("error to get container specs from metadata, %v", err))
-			}
-			saveOpts.Metadata[ContainerSpecsKey] = specsStr
-			saveOpts.Save(k.SupervisorContext(), k, l.watchdog)
+			defer saveOpts.Close()
+			l.saveWithOpts(&saveOpts, &control.SaveRestoreExecOpts{})
 		})
 	}
 }

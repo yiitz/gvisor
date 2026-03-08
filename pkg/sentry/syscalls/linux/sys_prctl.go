@@ -84,11 +84,12 @@ func Prctl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 		val := args[1].Int()
 		// prctl(2): arg2 must be either 0 (permitted capabilities are cleared)
 		// or 1 (permitted capabilities are kept).
-		if val == 0 {
+		switch val {
+		case 0:
 			t.SetKeepCaps(false)
-		} else if val == 1 {
+		case 1:
 			t.SetKeepCaps(true)
-		} else {
+		default:
 			return 0, nil, linuxerr.EINVAL
 		}
 
@@ -116,7 +117,7 @@ func Prctl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 		}
 
 	case linux.PR_SET_MM:
-		if !t.HasCapability(linux.CAP_SYS_RESOURCE) {
+		if !t.HasRootCapability(linux.CAP_SYS_RESOURCE) {
 			return 0, nil, linuxerr.EPERM
 		}
 
@@ -165,15 +166,17 @@ func Prctl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 		if args[1].Int() != 1 || args[2].Int() != 0 || args[3].Int() != 0 || args[4].Int() != 0 {
 			return 0, nil, linuxerr.EINVAL
 		}
-		// PR_SET_NO_NEW_PRIVS is assumed to always be set.
-		// See kernel.Task.updateCredsForExecLocked.
+		t.SetNoNewPrivs()
 		return 0, nil, nil
 
 	case linux.PR_GET_NO_NEW_PRIVS:
 		if args[1].Int() != 0 || args[2].Int() != 0 || args[3].Int() != 0 || args[4].Int() != 0 {
 			return 0, nil, linuxerr.EINVAL
 		}
-		return 1, nil, nil
+		if t.GetNoNewPrivs() {
+			return 1, nil, nil
+		}
+		return 0, nil, nil
 
 	case linux.PR_SET_PTRACER:
 		pid := args[1].Int()
@@ -199,7 +202,11 @@ func Prctl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, 
 			return 0, nil, linuxerr.EINVAL
 		}
 
-		return 0, nil, seccomp(t, linux.SECCOMP_SET_MODE_FILTER, 0, args[2].Pointer())
+		ctrl, err := seccomp(t, linux.SECCOMP_SET_MODE_FILTER, 0, args[2].Pointer())
+		if err != nil {
+			return 0, nil, err
+		}
+		return 0, ctrl, nil
 
 	case linux.PR_GET_SECCOMP:
 		return uintptr(t.SeccompMode()), nil, nil

@@ -33,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
@@ -151,7 +152,7 @@ func New(ctx context.Context, vfsObj *vfs.VirtualFilesystem, entries uint32, par
 
 	// iouringfd is always set up with read/write mode.
 	// See io_uring/io_uring.c:io_uring_install_fd().
-	if err := iouringfd.vfsfd.Init(iouringfd, uint32(linux.O_RDWR), vd.Mount(), vd.Dentry(), &vfs.FileDescriptionOptions{
+	if err := iouringfd.vfsfd.Init(iouringfd, uint32(linux.O_RDWR), auth.CredentialsFromContext(ctx), vd.Mount(), vd.Dentry(), &vfs.FileDescriptionOptions{
 		UseDentryMetadata: true,
 		DenyPRead:         true,
 		DenyPWrite:        true,
@@ -497,11 +498,7 @@ func (fd *FileDescription) handleReadv(t *kernel.Task, sqe *linux.IOUringSqe, fl
 		return 0, linuxerr.EINVAL
 	}
 
-	// AddressSpaceActive is set to true as we are doing this from the task goroutine.And this is a
-	// case as we currently don't support neither IOPOLL nor SQPOLL modes.
-	dst, err := t.IovecsIOSequence(hostarch.Addr(sqe.AddrOrSpliceOff), int(sqe.Len), usermem.IOOpts{
-		AddressSpaceActive: true,
-	})
+	dst, err := t.IovecsIOSequence(hostarch.Addr(sqe.AddrOrSpliceOff), int(sqe.Len), usermem.IOOpts{})
 	if err != nil {
 		return 0, err
 	}

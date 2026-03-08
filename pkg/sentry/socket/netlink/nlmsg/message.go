@@ -16,12 +16,14 @@
 package nlmsg
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bits"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 )
@@ -88,9 +90,27 @@ func ParseMessage(buf []byte) (msg *Message, rest []byte, ok bool) {
 	}, []byte(b), true
 }
 
+// PeekHeader peeks at the header of the message from the given buffer,
+// leaving the buffer unchanged. If the header is not present, it returns false.
+func PeekHeader(buf []byte) (linux.NetlinkMessageHeader, bool) {
+	b := BytesView(buf)
+	hdrBytes, ok := b.Extract(linux.NetlinkMessageHeaderSize)
+	if !ok {
+		return linux.NetlinkMessageHeader{}, false
+	}
+	var hdr linux.NetlinkMessageHeader
+	hdr.UnmarshalUnsafe(hdrBytes)
+	return hdr, true
+}
+
 // Header returns the header of this message.
 func (m *Message) Header() linux.NetlinkMessageHeader {
 	return m.hdr
+}
+
+// Buffer returns the buffer of this message.
+func (m *Message) Buffer() []byte {
+	return m.buf
 }
 
 // GetData unmarshals the payload message header from this netlink message, and
@@ -190,6 +210,34 @@ func (m *Message) PutAttrString(atype uint16, s string) {
 	m.putZeros(aligned - l)
 }
 
+// PutNestedAttr adds v to the message as a netlink nested attribute.
+func (m *Message) PutNestedAttr(atype uint16, v NestedAttr) {
+	m.PutAttr(atype, primitive.AsByteSlice(v))
+}
+
+// NestedAttr represents a nested netlink attribute.
+type NestedAttr []byte
+
+// PutAttr adds v to the provided NestedAttr, creating nested attributes.
+func (n *NestedAttr) PutAttr(atype uint16, v marshal.Marshallable) {
+	m := Message{
+		buf: *n,
+	}
+	m.PutAttr(atype, v)
+	// m.buf may have been reallocated in PutAttr, so update the NestedAttr.
+	*n = m.buf
+}
+
+// PutAttrString adds s to the provided NestedAttr, creating nested attributes.
+func (n *NestedAttr) PutAttrString(atype uint16, s string) {
+	m := Message{
+		buf: *n,
+	}
+	m.PutAttrString(atype, s)
+	// m.buf may have been reallocated in PutAttrString, so update the NestedAttr.
+	*n = m.buf
+}
+
 // MessageSet contains a series of netlink messages.
 type MessageSet struct {
 	// Multi indicates that this a multi-part message, to be terminated by
@@ -207,6 +255,9 @@ type MessageSet struct {
 
 	// Messages contains the messages in the set.
 	Messages []*Message
+
+	// ContainsError indicates that the message set contains at least one error.
+	ContainsError bool
 }
 
 // NewMessageSet creates a new MessageSet.
@@ -238,6 +289,11 @@ func (ms *MessageSet) AddMessage(hdr linux.NetlinkMessageHeader) *Message {
 	return m
 }
 
+// Clear resets the message set.
+func (ms *MessageSet) Clear() {
+	ms.Messages = nil
+}
+
 // AttrsView is a view into the attributes portion of a netlink message.
 type AttrsView []byte
 
@@ -252,17 +308,20 @@ func (v AttrsView) ParseFirst() (hdr linux.NetlinkAttrHeader, value []byte, rest
 
 	hdrBytes, ok := b.Extract(linux.NetlinkAttrHeaderSize)
 	if !ok {
+		log.Debugf("Failed to parse netlink attributes at header stage")
 		return
 	}
 	hdr.UnmarshalUnsafe(hdrBytes)
 
 	value, ok = b.Extract(int(hdr.Length) - linux.NetlinkAttrHeaderSize)
 	if !ok {
+		log.Debugf("Failed to parse %d bytes after %d header bytes", int(hdr.Length)-linux.NetlinkAttrHeaderSize, linux.NetlinkAttrHeaderSize)
 		return
 	}
 
 	_, ok = b.Extract(alignPad(int(hdr.Length), linux.NLA_ALIGNTO))
 	if !ok {
+		log.Debugf("Failed to parse netlink attributes at aligning stage")
 		return
 	}
 
@@ -300,6 +359,18 @@ func (v *BytesView) Extract(n int) ([]byte, bool) {
 	return extracted, true
 }
 
+// Retrieve returns the first n bytes from v, leaving v unchanged. If n is out of
+// bounds, it returns false.
+func (v *BytesView) Retrieve(n int) ([]byte, bool) {
+	b := []byte(*v)
+	if n < 0 || n > len(b) {
+		return nil, false
+	}
+
+	retrieved := b[:n]
+	return retrieved, true
+}
+
 // String converts the raw attribute value to string.
 func (v *BytesView) String() string {
 	b := []byte(*v)
@@ -310,6 +381,28 @@ func (v *BytesView) String() string {
 		b = b[:len(b)-1]
 	}
 	return string(b)
+}
+
+// Uint8 converts the raw attribute value to uint8.
+func (v *BytesView) Uint8() (uint8, bool) {
+	attr := []byte(*v)
+	val := primitive.Uint8(0)
+	if len(attr) != val.SizeBytes() {
+		return 0, false
+	}
+	val.UnmarshalBytes(attr)
+	return uint8(val), true
+}
+
+// Uint16 converts the raw attribute value to uint16.
+func (v *BytesView) Uint16() (uint16, bool) {
+	attr := []byte(*v)
+	val := primitive.Uint16(0)
+	if len(attr) != val.SizeBytes() {
+		return 0, false
+	}
+	val.UnmarshalBytes(attr)
+	return uint16(val), true
 }
 
 // Uint32 converts the raw attribute value to uint32.
@@ -323,6 +416,39 @@ func (v *BytesView) Uint32() (uint32, bool) {
 	return uint32(val), true
 }
 
+// Uint64 converts the raw attribute value to uint64.
+func (v *BytesView) Uint64() (uint64, bool) {
+	attr := []byte(*v)
+	val := primitive.Uint64(0)
+	if len(attr) != val.SizeBytes() {
+		return 0, false
+	}
+	val.UnmarshalBytes(attr)
+	return uint64(val), true
+}
+
+// Int8 converts the raw attribute value to int8.
+func (v *BytesView) Int8() (int8, bool) {
+	attr := []byte(*v)
+	val := primitive.Int8(0)
+	if len(attr) != val.SizeBytes() {
+		return 0, false
+	}
+	val.UnmarshalBytes(attr)
+	return int8(val), true
+}
+
+// Int16 converts the raw attribute value to int32.
+func (v *BytesView) Int16() (int16, bool) {
+	attr := []byte(*v)
+	val := primitive.Int16(0)
+	if len(attr) != val.SizeBytes() {
+		return 0, false
+	}
+	val.UnmarshalBytes(attr)
+	return int16(val), true
+}
+
 // Int32 converts the raw attribute value to int32.
 func (v *BytesView) Int32() (int32, bool) {
 	attr := []byte(*v)
@@ -332,4 +458,81 @@ func (v *BytesView) Int32() (int32, bool) {
 	}
 	val.UnmarshalBytes(attr)
 	return int32(val), true
+}
+
+// Int64 converts the raw attribute value to int32.
+func (v *BytesView) Int64() (int64, bool) {
+	attr := []byte(*v)
+	val := primitive.Int64(0)
+	if len(attr) != val.SizeBytes() {
+		return 0, false
+	}
+	val.UnmarshalBytes(attr)
+	return int64(val), true
+}
+
+// NetToHostU16 converts a uint16 in network byte order to
+// host byte order value.
+func NetToHostU16(v uint16) uint16 {
+	var b [2]byte
+	binary.BigEndian.PutUint16(b[:], v)
+	return binary.NativeEndian.Uint16(b[:])
+}
+
+// NetToHostU32 converts a uint32 in network byte order to
+// host byte order value.
+func NetToHostU32(v uint32) uint32 {
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], v)
+	return binary.NativeEndian.Uint32(b[:])
+}
+
+// NetToHostU64 converts a uint64 in network byte order to
+// host byte order value.
+func NetToHostU64(v uint64) uint64 {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], v)
+	return binary.NativeEndian.Uint64(b[:])
+}
+
+// HostToNetU16 converts a uint16 in host byte order to
+// network byte order value.
+func HostToNetU16(v uint16) uint16 {
+	var b [2]byte
+	binary.NativeEndian.PutUint16(b[:], v)
+	return binary.BigEndian.Uint16(b[:])
+}
+
+// HostToNetU32 converts a uint32 in host byte order to
+// network byte order value.
+func HostToNetU32(v uint32) uint32 {
+	var b [4]byte
+	binary.NativeEndian.PutUint32(b[:], v)
+	return binary.BigEndian.Uint32(b[:])
+}
+
+// HostToNetU64 converts a uint64 in host byte order to
+// network byte order value.
+func HostToNetU64(v uint64) uint64 {
+	var b [8]byte
+	binary.NativeEndian.PutUint64(b[:], v)
+	return binary.BigEndian.Uint64(b[:])
+}
+
+// PutU16 converts a uint16 to network byte order and returns it as a
+// marshal.Marshallable.
+func PutU16(val uint16) marshal.Marshallable {
+	return primitive.AllocateUint16(HostToNetU16(val))
+}
+
+// PutU32 converts a uint32 to network byte order and returns it as a
+// marshal.Marshallable.
+func PutU32(val uint32) marshal.Marshallable {
+	return primitive.AllocateUint32(HostToNetU32(val))
+}
+
+// PutU64 converts a uint64 to network byte order and returns it as a
+// marshal.Marshallable.
+func PutU64(val uint64) marshal.Marshallable {
+	return primitive.AllocateUint64(HostToNetU64(val))
 }
